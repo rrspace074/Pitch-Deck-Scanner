@@ -1,0 +1,358 @@
+# app.py — Streamlit x Dify "Pitch Deck Scanner" (single-shot app)
+# Run:  streamlit run app.py
+# Env vars expected (or via .streamlit/secrets.toml):
+#   NEXT_PUBLIC_API_URL   (default: https://api.dify.ai/v1)
+#   NEXT_PUBLIC_APP_KEY   (required)
+#   NEXT_PUBLIC_APP_ID    (optional)
+
+import os
+import json
+import base64
+import random
+import mimetypes
+import uuid
+import hashlib
+from typing import Generator, List, Optional
+
+import requests
+import streamlit as st
+
+# -----------------------------
+# Config & helpers
+# -----------------------------
+
+def _get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
+    # Prefer Streamlit secrets first, then environment
+    try:
+        val = st.secrets.get(name)  # type: ignore[attr-defined]
+        if val:
+            return str(val)
+    except Exception:
+        pass
+    return os.getenv(name, default)
+
+API_BASE = _get_secret("NEXT_PUBLIC_API_URL", "https://api.dify.ai/v1").rstrip("/")
+API_KEY = _get_secret("NEXT_PUBLIC_APP_KEY", "")
+APP_ID = _get_secret("NEXT_PUBLIC_APP_ID", "")
+
+# Stable per-session user id (Dify requires a user identifier)
+if "dify_user" not in st.session_state:
+    st.session_state.dify_user = f"user-{uuid.uuid4()}"
+
+# Track Dify conversation id
+if "conversation_id" not in st.session_state:
+    st.session_state.conversation_id = None
+
+# Track uploads across reruns to avoid re-uploading same file
+st.session_state.setdefault("uploaded_fps", {})   # fp -> {id, type, name}
+st.session_state.setdefault("uploaded_payload", [])
+st.session_state.setdefault("uploader_key", 0)
+
+# -----------------------------
+# Page config + styles
+# -----------------------------
+
+st.set_page_config(page_title="Pitch Deck Scanner • Dify", page_icon="🤖", layout="wide")
+
+BANNER_CSS = """
+<style>
+    .banner { 
+        margin: 8px 0 28px 0;
+        width: 100%;
+        border-radius: 18px; 
+        background: linear-gradient(90deg,#f5a10b 0%, #ff8a00 45%, #f37018 100%);
+        display: flex; align-items: center; justify-content: center; 
+        padding: 34px 40px;
+        box-sizing: border-box;
+        min-height: 120px;
+    }
+    .brand-row { display:flex; align-items:center; justify-content:center; gap: 40px; }
+    .brand-row .title { color: white; font-weight: 900; font-size: 2.2rem; display: inline-flex; align-items: center; gap: 14px; }
+    .brand-row .title .emoji { font-size: 2.4rem; }
+    .brand-row .right { display:flex; align-items:center; gap: 12px; }
+    .brand-row .powered { color: rgba(255,255,255,.98); font-weight: 800; font-size: 1.15rem; }
+    .brand-row .logo { height: 72px; width: auto; border-radius: 8px; }
+    .spacer24 { height: 24px; }
+    .spacer32 { height: 32px; }
+    .tiny { text-align:center; font-size: .8rem; color: rgba(49,51,63,.6); margin-top: 10px; }
+    .result-box { border: 1px solid rgba(0,0,0,.08); border-radius: 10px; padding: 16px; }
+    /* Gradient style for PRIMARY buttons only (Start) */
+    .stButton > button[kind="primary"] { background: linear-gradient(90deg,#f5a10b 0%, #ff8a00 45%, #f37018 100%) !important; color: #fff !important; border: none !important; }
+    .stButton > button[kind="primary"]:hover { filter: brightness(0.98); }
+    /* Hide Streamlit's default 200MB hint below the uploader */
+    div[data-testid="stFileUploader"] small { display: none !important; }
+</style>
+"""
+
+st.markdown(BANNER_CSS, unsafe_allow_html=True)
+
+# Load local logo (your_logo.jpeg) as base64 so we can embed in HTML
+
+def _load_logo_b64(path: str = "your_logo.jpeg") -> Optional[str]:
+    try:
+        with open(path, "rb") as f:
+            return base64.b64encode(f.read()).decode("ascii")
+    except Exception:
+        return None
+
+logo_b64 = _load_logo_b64()
+logo_img_tag = f'<img class="logo" src="data:image/jpeg;base64,{logo_b64}">' if logo_b64 else ""
+
+st.markdown(
+    f"""
+    <div class=\"banner\">
+        <div class=\"brand-row\">
+            <div class=\"title\"><span class=\"emoji\">📄</span> Pitch Deck Scanner</div>
+            <div class=\"right\"><span class=\"powered\">powered by</span>{logo_img_tag}</div>
+        </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
+
+# Remove the previous instructional line and add clean spacing
+st.markdown('<div class="spacer24"></div>', unsafe_allow_html=True)
+
+# -----------------------------
+# Sidebar — only "Clear conversation"
+# -----------------------------
+with st.sidebar:
+    st.write("")
+    if st.button("Clear conversation", type="secondary", use_container_width=True):
+        st.session_state.conversation_id = None
+        st.session_state.uploaded_fps = {}
+        st.session_state.uploaded_payload = []
+        st.session_state.pop("last_output", None)
+        st.session_state["uploader_key"] += 1  # reset the file_uploader selection
+        st.rerun()
+
+    # Info line under the button
+    st.markdown("<div style='display:flex;align-items:center;gap:8px;color:rgba(49,51,63,.8);font-size:0.9rem;'>ℹ️ <span>Reload if it doesn't respond in 60 sec.</span></div>", unsafe_allow_html=True)
+
+# Safety check for key (no sidebar inputs anymore)
+if not API_KEY:
+    st.warning("Set NEXT_PUBLIC_APP_KEY as an environment variable or in .streamlit/secrets.toml to use the app.")
+
+# -----------------------------
+# Dify HTTP helpers
+# -----------------------------
+
+def _headers(json_mode: bool = True) -> dict:
+    h = {"Authorization": f"Bearer {API_KEY}"}
+    if json_mode:
+        h["Content-Type"] = "application/json"
+    if APP_ID:
+        h["X-Dify-App-Id"] = APP_ID
+    return h
+
+
+def _infer_file_type(mime: str) -> str:
+    if not mime:
+        return "document"
+    if mime.startswith("image/"):
+        return "image"
+    if mime.startswith("audio/"):
+        return "audio"
+    if mime.startswith("video/"):
+        return "video"
+    return "document"
+
+
+def dify_upload_file(file_name: str, file_bytes: bytes, mime: Optional[str], user: str) -> str:
+    """Upload a file to Dify for this conversation; returns upload_file_id."""
+    url = f"{API_BASE}/files/upload"
+    files = {"file": (file_name, file_bytes, mime or "application/octet-stream")} 
+    data = {"purpose": "conversation", "user": user}
+    resp = requests.post(url, headers={"Authorization": f"Bearer {API_KEY}"}, files=files, data=data, timeout=600)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Upload failed ({resp.status_code}): {resp.text}")
+    j = resp.json()
+    upload_id = j.get("id") or j.get("data", {}).get("id")
+    if not upload_id:
+        raise RuntimeError(f"Unexpected upload response: {j}")
+    return upload_id
+
+
+def dify_stream_chat(query: str, files_payload: Optional[List[dict]], user: str) -> Generator[str, None, None]:
+    payload = {"inputs": {}, "query": query, "response_mode": "streaming", "user": user}
+    if st.session_state.conversation_id:
+        payload["conversation_id"] = st.session_state.conversation_id
+    if files_payload:
+        payload["files"] = files_payload
+
+    url = f"{API_BASE}/chat-messages"
+    with requests.post(url, headers=_headers(json_mode=True), json=payload, stream=True, timeout=1200) as r:
+        if r.status_code >= 400:
+            try:
+                err = r.json()
+            except Exception:
+                err = r.text
+            raise RuntimeError(f"{r.status_code}: {err}")
+        for raw in r.iter_lines(decode_unicode=True):
+            if not raw or raw.startswith(":"):
+                continue
+            if not raw.startswith("data:"):
+                continue
+            data_str = raw[5:].strip()
+            if not data_str:
+                continue
+            try:
+                evt = json.loads(data_str)
+            except Exception:
+                continue
+            conv_id = evt.get("conversation_id")
+            if conv_id and not st.session_state.conversation_id:
+                st.session_state.conversation_id = conv_id
+            event_type = evt.get("event")
+            if event_type in ("message", "agent_message", "tool_message"):
+                delta = evt.get("answer") or evt.get("output_text") or ""
+                if delta:
+                    yield delta
+            elif event_type in ("message_end", "agent_message_end", "completed", "workflow_finished"):
+                break
+            elif event_type == "error":
+                err_msg = evt.get("message") or evt.get("error") or "Model error"
+                raise RuntimeError(err_msg)
+
+# -----------------------------
+# Minimal single-shot UI with pre-upload + progress
+# -----------------------------
+
+accepted_mimes = [
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/msword",
+    "text/plain",
+]
+
+files = st.file_uploader(
+    "Attach your pitch deck (PDF / PPT / DOCX)",
+    type=["pdf", "ppt", "pptx", "doc", "docx", "txt"],
+    accept_multiple_files=True,
+    help="Uploads are sent to Dify for this conversation.",
+    key=f"uploader_{st.session_state['uploader_key']}"
+)
+
+st.caption("Max 15MB per file • PDF, PPT, PPTX, DOC, DOCX, TXT")
+
+# Extra vertical breathing room under the banner
+st.markdown('<div class="spacer32"></div>', unsafe_allow_html=True)
+
+# When user selects files, upload them immediately and show a progress bar.
+ready_to_start = False
+current_fps = []
+if files:
+    # Compute fingerprints and upload any new ones
+    total = len(files)
+    uploaded_count = 0
+    progress_bar_slot = st.empty()
+    progress_text_slot = st.empty()
+    bar = progress_bar_slot.progress(0)
+    progress_text_slot.caption(f"Uploading files… (0/{total})")
+
+    new_payload: List[dict] = []
+
+    for idx, uf in enumerate(files, start=1):
+        data = uf.getvalue()
+        # Enforce 15MB per file limit
+        if len(data) > 15 * 1024 * 1024:
+            size_mb = len(data) / (1024 * 1024)
+            progress_bar_slot.empty()
+            progress_text_slot.empty()
+            st.error(f"{uf.name} is {size_mb:.2f} MB. Maximum allowed is 15 MB.")
+            st.stop()
+        mime = uf.type or mimetypes.guess_type(uf.name)[0] or "application/octet-stream"
+        fp = hashlib.sha256(data).hexdigest()
+        current_fps.append(fp)
+
+        if fp not in st.session_state.uploaded_fps:
+            try:
+                upload_id = dify_upload_file(uf.name, data, mime, st.session_state.dify_user)
+                st.session_state.uploaded_fps[fp] = {
+                    "id": upload_id,
+                    "type": _infer_file_type(mime),
+                    "name": uf.name,
+                }
+            except Exception as e:
+                progress_bar_slot.empty()
+                progress_text_slot.empty()
+                st.error(f"Attachment upload failed — model is sleeping 😴. Try reloading.\n\nDetails: {e}")
+                st.stop()
+        # Build payload in current order
+        rec = st.session_state.uploaded_fps[fp]
+        new_payload.append({
+            "type": rec["type"],
+            "transfer_method": "local_file",
+            "upload_file_id": rec["id"],
+        })
+
+        uploaded_count = idx
+        pct = int((uploaded_count / total) * 100)
+        # Move smoothly
+        bar.progress(min(pct, 100))
+        progress_text_slot.caption(f"Uploading files… {uf.name} ({idx}/{total})")
+
+    # Remove entries for files no longer selected
+    to_keep = set(current_fps)
+    st.session_state.uploaded_fps = {k: v for k, v in st.session_state.uploaded_fps.items() if k in to_keep}
+
+    st.session_state.uploaded_payload = new_payload
+    progress_bar_slot.empty()
+    progress_text_slot.empty()
+    st.success(f"Files ready ✅  ({uploaded_count}/{total})")
+    ready_to_start = uploaded_count == total and total > 0
+else:
+    # If no files selected, reset uploaded payload
+    st.session_state.uploaded_payload = []
+
+# Start button enabled only after uploads finished
+start_placeholder = st.empty()
+start = start_placeholder.button("Start", type="primary", use_container_width=True, disabled=(not ready_to_start))
+
+if start:
+    # Remove the Start button and show a "Model is cooking…" label with a live progress bar
+    start_placeholder.empty()
+    cooking_text = st.empty()
+    cooking_text.markdown("<div style='text-align:center; color: rgba(49,51,63,.75); margin: 6px 0;'>Model is cooking…</div>", unsafe_allow_html=True)
+
+    files_payload: List[dict] = st.session_state.uploaded_payload or []
+
+    RANDOM_QUERIES = [
+        "Scan this pitch deck and give a crisp summary (company, problem, solution, traction, ask).",
+        "Extract key metrics, GTM, business model, competitors and risks from this deck.",
+        "Summarize the opportunity, product, moat, and top 5 red flags in this deck.",
+        "Create a bullet summary of team, roadmap, market size, business model and funding ask.",
+    ]
+    query = random.choice(RANDOM_QUERIES)
+
+    try:
+        # Visual progress bar while the model is generating; fills to 90% gradually and 100% at completion.
+        prog_slot = st.empty()
+        prog = prog_slot.progress(0)
+
+        def _with_progress(gen):
+            pct = 0
+            for chunk in gen:
+                pct = min(90, pct + 2)
+                prog.progress(pct)
+                yield chunk
+            prog.progress(100)
+
+        final_text = st.write_stream(_with_progress(dify_stream_chat(query, files_payload or None, st.session_state.dify_user)))
+        # clear the progress UI once complete
+        prog_slot.empty()
+        cooking_text.empty()
+        st.session_state.last_output = final_text
+    except Exception as e:
+        st.error("Model is sleeping 😴. Try to reload the app.")
+        with st.expander("Show technical details", expanded=False):
+            st.code(str(e))
+
+# Show last output if present (after rerun etc.)
+if st.session_state.get("last_output") and not start:
+    st.markdown(f"<div class='result-box'>{st.session_state.last_output}</div>", unsafe_allow_html=True)
+
+# Footer
+st.markdown('<div class="tiny">Built with Streamlit + Dify Service API</div>', unsafe_allow_html=True)
