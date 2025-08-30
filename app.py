@@ -1,4 +1,4 @@
-# app.py — Streamlit x Dify "Pitch Deck Scanner" (single-shot app)
+# app.py — Streamlit x Dify "Pitch Audit AI" (single-shot app)
 # Run:  streamlit run app.py
 # Env vars expected (or via .streamlit/secrets.toml):
 #   NEXT_PUBLIC_API_URL   (default: https://api.dify.ai/v1)
@@ -52,7 +52,7 @@ st.session_state.setdefault("uploader_key", 0)
 # Page config + styles
 # -----------------------------
 
-st.set_page_config(page_title="Pitch Deck Scanner • Dify", page_icon="🤖", layout="wide")
+st.set_page_config(page_title="Pitch Audit AI • Dify", page_icon="🤖", layout="wide")
 
 BANNER_CSS = """
 <style>
@@ -77,7 +77,7 @@ BANNER_CSS = """
     .tiny { text-align:center; font-size: .8rem; color: rgba(49,51,63,.6); margin-top: 10px; }
     .result-box { border: 1px solid rgba(0,0,0,.08); border-radius: 10px; padding: 16px; }
     /* Gradient style for PRIMARY buttons only (Start) */
-    .stButton > button[kind="primary"] { background: linear-gradient(90deg,#f5a10b 0%, #ff8a00 45%, #f37018 100%) !important; color: #fff !important; border: none !important; }
+    .stButton > button[kind="primary"] { background: linear-gradient(90deg,#f5a10b 0%, #ff8a00 45%, #f37018 100%) !important; color: #fff !important; border: none !important; padding: 0.5rem 1.5rem; margin: 0 auto; display: block; max-width: 240px; }
     .stButton > button[kind="primary"]:hover { filter: brightness(0.98); }
     /* Hide Streamlit's default 200MB hint below the uploader */
     div[data-testid="stFileUploader"] small { display: none !important; }
@@ -102,7 +102,7 @@ st.markdown(
     f"""
     <div class=\"banner\">
         <div class=\"brand-row\">
-            <div class=\"title\"><span class=\"emoji\">📄</span> Pitch Deck Scanner</div>
+            <div class=\"title\"><span class=\"emoji\">📄</span> Pitch Audit AI</div>
             <div class=\"right\"><span class=\"powered\">powered by</span>{logo_img_tag}</div>
         </div>
     </div>
@@ -239,6 +239,12 @@ st.caption("Max 15MB per file • PDF, PPT, PPTX, DOC, DOCX, TXT")
 
 # Extra vertical breathing room under the banner
 st.markdown('<div class="spacer32"></div>', unsafe_allow_html=True)
+
+st.markdown('<div class="spacer24"></div>', unsafe_allow_html=True)
+st.markdown(
+    "<div style='text-align:center; color: rgba(49,51,63,.75); font-size: 1.2rem; margin-bottom: 24px;'>DeckBench analyzes your deck against proven investor templates, flags gaps, and rewrites slides using your content. Get a readiness score, must-fix checklist, and clean exports—no jargon, no guesswork.</div>",
+    unsafe_allow_html=True
+)
 
 # When user selects files, upload them immediately and show a progress bar.
 ready_to_start = False
