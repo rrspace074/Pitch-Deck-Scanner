@@ -75,6 +75,12 @@ DARK_THEME_CSS = """
       var(--bg);
     color: var(--text);
   }
+  /* Remove Streamlit default white top header */
+  header[data-testid="stHeader"],
+  div[data-testid="stHeader"],
+  div[data-testid="stToolbar"]{
+    display: none !important;
+  }
   .block-container{ padding-top: 0 !important; }
   section[data-testid="stSidebar"]{ background:#0b0e12; border-right:1px solid rgba(255,255,255,.06); }
 
@@ -110,10 +116,12 @@ DARK_THEME_CSS = """
     background:linear-gradient(180deg, var(--gold) 0%, var(--gold-2) 100%) !important;
     color:#14161e !important;
   }
-  div[data-testid="stFileUploaderDropzone"] *{ color:#14161e !important; }
-  /* Replace default 200MB helper text with 15MB */
+  div[data-testid="stFileUploaderDropzone"] *{ color:#14161e !important; }Limit 15MB
   div[data-testid="stFileUploaderDropzone"] p:nth-of-type(2){ color:transparent !important; position:relative; }
   div[data-testid="stFileUploaderDropzone"] p:nth-of-type(2)::after{ content: "Limit 15MB per file • PDF, PPT, PPTX, DOC, DOCX, TXT"; position:absolute; left:0; right:0; top:0; color:#14161e !important; }
+  /* Fallback targeting for versions where the helper is the last <p> */
+  div[data-testid="stFileUploaderDropzone"] p:last-of-type{ color:transparent !important; position:relative; }
+  div[data-testid="stFileUploaderDropzone"] p:last-of-type::after{ content: "Limit 15MB per file • PDF, PPT, PPTX, DOC, DOCX, TXT"; position:absolute; left:0; right:0; top:0; color:#14161e !important; }
   /* Browse button inside uploader */
   div[data-testid="stFileUploader"] button{ background:#14161e !important; color:var(--text) !important; border:1px solid rgba(20,22,30,.45) !important; border-radius:10px !important; }
   div[data-testid="stFileUploader"] small { display: none !important; }
@@ -274,7 +282,7 @@ files = st.file_uploader(
     key=f"uploader_{st.session_state['uploader_key']}"
 )
 
-# Removed per request: external max-size line under the dropzone
+st.markdown("<div style='text-align:center;color:#EAEFF5;margin-top:8px;font-weight:700;'>15MB limit per file • PDF, PPT, PPTX, DOC, DOCX, TXT</div>", unsafe_allow_html=True)
 
 # Extra vertical breathing room under the banner
 st.markdown('<div class="spacer32"></div>', unsafe_allow_html=True)
@@ -399,5 +407,3 @@ if start:
 if st.session_state.get("last_output") and not start:
     st.markdown(f"<div class='result-box'>{st.session_state.last_output}</div>", unsafe_allow_html=True)
 
-# Footer
-st.markdown('<div class="tiny">Built with Streamlit + Dify Service API</div>', unsafe_allow_html=True)
