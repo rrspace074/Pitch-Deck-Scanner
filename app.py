@@ -282,7 +282,7 @@ files = st.file_uploader(
     key=f"uploader_{st.session_state['uploader_key']}"
 )
 
-st.markdown("<div style='text-align:center;color:#EAEFF5;margin-top:8px;font-weight:700;'>15MB limit per file • PDF, PPT, PPTX, DOC, DOCX, TXT</div>", unsafe_allow_html=True)
+# Removed per request: external max-size line under the dropzone
 
 # Extra vertical breathing room under the banner
 st.markdown('<div class="spacer32"></div>', unsafe_allow_html=True)
@@ -406,4 +406,5 @@ if start:
 # Show last output if present (after rerun etc.)
 if st.session_state.get("last_output") and not start:
     st.markdown(f"<div class='result-box'>{st.session_state.last_output}</div>", unsafe_allow_html=True)
+
 
