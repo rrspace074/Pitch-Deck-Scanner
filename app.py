@@ -54,37 +54,80 @@ st.session_state.setdefault("uploader_key", 0)
 
 st.set_page_config(page_title="Pitch Audit AI • Dify", page_icon="🤖", layout="wide")
 
-BANNER_CSS = """
+# --- Dark theme with gold accents (inspired by reference) ---
+DARK_THEME_CSS = """
 <style>
-    .banner { 
-        margin: 8px 0 28px 0;
-        width: 100%;
-        border-radius: 18px; 
-        background: linear-gradient(90deg,#f5a10b 0%, #ff8a00 45%, #f37018 100%);
-        display: flex; align-items: center; justify-content: center; 
-        padding: 34px 40px;
-        box-sizing: border-box;
-        min-height: 120px;
-    }
-    .brand-row { display:flex; align-items:center; justify-content:center; gap: 40px; }
-    .brand-row .title { color: white; font-weight: 900; font-size: 2.2rem; display: inline-flex; align-items: center; gap: 14px; }
-    .brand-row .title .emoji { font-size: 2.4rem; }
-    .brand-row .right { display:flex; align-items:center; gap: 12px; }
-    .brand-row .powered { color: rgba(255,255,255,.98); font-weight: 800; font-size: 1.15rem; }
-    .brand-row .logo { height: 72px; width: auto; border-radius: 8px; }
-    .spacer24 { height: 24px; }
-    .spacer32 { height: 32px; }
-    .tiny { text-align:center; font-size: .8rem; color: rgba(49,51,63,.6); margin-top: 10px; }
-    .result-box { border: 1px solid rgba(0,0,0,.08); border-radius: 10px; padding: 16px; }
-    /* Gradient style for PRIMARY buttons only (Start) */
-    .stButton > button[kind="primary"] { background: linear-gradient(90deg,#f5a10b 0%, #ff8a00 45%, #f37018 100%) !important; color: #fff !important; border: none !important; padding: 0.5rem 1.5rem; margin: 0 auto; display: block; max-width: 240px; }
-    .stButton > button[kind="primary"]:hover { filter: brightness(0.98); }
-    /* Hide Streamlit's default 200MB hint below the uploader */
-    div[data-testid="stFileUploader"] small { display: none !important; }
+  :root{
+    --gold: #F5C542;
+    --gold-2: #D9A521;
+    --bg: #0c0f14;
+    --panel: #11151d;
+    --text: #EAEFF5;
+    --muted: #B7BEC9;
+    --muted-2: #96A0AF;
+  }
+  /* App background */
+  div[data-testid="stAppViewContainer"]{
+    background:
+      radial-gradient(80% 120% at 10% 10%, rgba(245,197,66,0.09) 0%, rgba(0,0,0,0) 55%),
+      radial-gradient(60% 100% at 90% 10%, rgba(245,197,66,0.07) 0%, rgba(0,0,0,0) 60%),
+      repeating-linear-gradient(135deg, rgba(245,197,66,0.06) 0 2px, rgba(0,0,0,0) 2px 22px),
+      var(--bg);
+    color: var(--text);
+  }
+  .block-container{ padding-top: 0 !important; }
+  section[data-testid="stSidebar"]{ background:#0b0e12; border-right:1px solid rgba(255,255,255,.06); }
+
+  /* Hero */
+  .hero{ margin: 24px 0 22px 0; padding: 64px 24px 48px; text-align: center; position: relative; background:
+      radial-gradient(120% 160% at 50% 0%, rgba(245,197,66,0.08) 0%, rgba(20,22,30,0.0) 60%);
+      border-radius: 20px;
+  }
+  .hero h1{ font-size:56px; line-height:1.1; margin:0 0 12px 0; color:var(--text); font-weight:800; }
+  .hero h1 .powered { font-size:18px; font-weight:700; color: var(--muted); margin-left:16px; vertical-align: middle; }
+  .hero h1 .powered img{ height:56px; width:auto; border-radius:10px; vertical-align:middle; margin-left:8px; }
+  .hero h2{ font-size:28px; font-weight:700; margin:0 0 16px 0; opacity:1; display:inline-block; padding:12px 20px; border-radius:14px; background:linear-gradient(180deg, var(--gold) 0%, var(--gold-2) 100%); color:#14161e; box-shadow:0 8px 24px rgba(245,197,66,0.25); }
+  .hero p{ color:var(--muted); margin:0 0 26px 0; font-size:16px; }
+  .hero .pill{ display:inline-block; padding:14px 22px; border-radius:14px; background:linear-gradient(180deg, var(--gold) 0%, var(--gold-2) 100%); color:#14161e; font-weight:800; box-shadow:0 8px 24px rgba(245,197,66,0.25); margin:10px 0 18px 0; }
+  .primary-cta{ background:linear-gradient(180deg,var(--gold) 0%, var(--gold-2) 100%); color:#14161e; font-weight:800; padding:12px 22px; border-radius:12px; border:1px solid rgba(255,255,255,.08); display:inline-block; box-shadow:0 8px 24px rgba(245,197,66,0.25); text-decoration:none; }
+  .primary-cta:hover{ filter:brightness(1.03); }
+  .small-note{ color:var(--muted-2); font-size:14px; margin-top:10px; }
+
+  /* Buttons */
+  .stButton > button[kind="primary"]{
+    background: linear-gradient(180deg, var(--gold) 0%, var(--gold-2) 100%) !important;
+    color: #14161e !important; border: 0 !important; border-radius: 12px !important; font-weight: 800 !important;
+    box-shadow: 0 8px 24px rgba(245,197,66,0.25) !important; padding: 0.6rem 1.5rem !important; max-width: 280px; margin: 0 auto; display:block;
+  }
+  .stButton > button[kind="secondary"]{
+    background:#161a22 !important; color: var(--text) !important; border:1px solid rgba(255,255,255,.08) !important; border-radius:12px !important;
+  }
+
+  /* Uploader */
+  div[data-testid="stFileUploaderDropzone"],
+  div[data-testid="stFileUploaderDropzone"] > div,
+  div[data-testid="stFileUploader"] section {
+    background:linear-gradient(180deg, var(--gold) 0%, var(--gold-2) 100%) !important;
+    color:#14161e !important;
+  }
+  div[data-testid="stFileUploaderDropzone"] *{ color:#14161e !important; }
+  /* Replace default 200MB helper text with 15MB */
+  div[data-testid="stFileUploaderDropzone"] p:nth-of-type(2){ color:transparent !important; position:relative; }
+  div[data-testid="stFileUploaderDropzone"] p:nth-of-type(2)::after{ content: "Limit 15MB per file • PDF, PPT, PPTX, DOC, DOCX, TXT"; position:absolute; left:0; right:0; top:0; color:#14161e !important; }
+  /* Browse button inside uploader */
+  div[data-testid="stFileUploader"] button{ background:#14161e !important; color:var(--text) !important; border:1px solid rgba(20,22,30,.45) !important; border-radius:10px !important; }
+  div[data-testid="stFileUploader"] small { display: none !important; }
+
+  /* Result + info */
+  .result-box { border: 1px solid rgba(255,255,255,.08); border-radius: 12px; padding: 16px; background: #0f131b; color: var(--text); }
+  .tiny { text-align:center; font-size:.85rem; color: var(--muted-2); margin-top: 10px; }
+  h1, h2, h3, h4, h5, h6, label, p, .stMarkdown { color: var(--text); }
+  .spacer24 { height:24px; }
+  .spacer32 { height:32px; }
 </style>
 """
 
-st.markdown(BANNER_CSS, unsafe_allow_html=True)
+st.markdown(DARK_THEME_CSS, unsafe_allow_html=True)
 
 # Load local logo (your_logo.jpeg) as base64 so we can embed in HTML
 
@@ -96,22 +139,18 @@ def _load_logo_b64(path: str = "your_logo.jpeg") -> Optional[str]:
         return None
 
 logo_b64 = _load_logo_b64()
-logo_img_tag = f'<img class="logo" src="data:image/jpeg;base64,{logo_b64}">' if logo_b64 else ""
+logo_img_tag = f'<img style="height:56px;width:auto;border-radius:10px;vertical-align:middle;margin-left:10px;" src="data:image/jpeg;base64,{logo_b64}">' if logo_b64 else ""
 
+# Hero section to match dark/gold theme
 st.markdown(
     f"""
-    <div class=\"banner\">
-        <div class=\"brand-row\">
-            <div class=\"title\"><span class=\"emoji\">📄</span> Pitch Audit AI</div>
-            <div class=\"right\"><span class=\"powered\">powered by</span>{logo_img_tag}</div>
-        </div>
+    <div class=\"hero\">
+        <h1>Pitch Audit AI <span class=\"powered\">powered by {logo_img_tag if logo_img_tag else 'AI'}</span></h1>
+        <h2>Create investor‑ready decks</h2>
     </div>
     """,
     unsafe_allow_html=True,
 )
-
-# Remove the previous instructional line and add clean spacing
-st.markdown('<div class="spacer24"></div>', unsafe_allow_html=True)
 
 # -----------------------------
 # Sidebar — only "Clear conversation"
@@ -127,7 +166,7 @@ with st.sidebar:
         st.rerun()
 
     # Info line under the button
-    st.markdown("<div style='display:flex;align-items:center;gap:8px;color:rgba(49,51,63,.8);font-size:0.9rem;'>ℹ️ <span>Reload if it doesn't respond in 60 sec.</span></div>", unsafe_allow_html=True)
+    st.markdown("<div style='display:flex;align-items:center;gap:8px;color:#B7BEC9;font-size:0.9rem;'>ℹ️ <span>Reload if it doesn't respond in 60 sec.</span></div>", unsafe_allow_html=True)
 
 # Safety check for key (no sidebar inputs anymore)
 if not API_KEY:
@@ -235,14 +274,14 @@ files = st.file_uploader(
     key=f"uploader_{st.session_state['uploader_key']}"
 )
 
-st.caption("Max 15MB per file • PDF, PPT, PPTX, DOC, DOCX, TXT")
+# Removed per request: external max-size line under the dropzone
 
 # Extra vertical breathing room under the banner
 st.markdown('<div class="spacer32"></div>', unsafe_allow_html=True)
 
 st.markdown('<div class="spacer24"></div>', unsafe_allow_html=True)
 st.markdown(
-    "<div style='text-align:center; color: rgba(49,51,63,.75); font-size: 1.2rem; margin-bottom: 24px;'>DeckBench analyzes your deck against proven investor templates, flags gaps, and rewrites slides using your content. Get a readiness score, must-fix checklist, and clean exports—no jargon, no guesswork.</div>",
+    "<div style='text-align:center; color: #B7BEC9; font-size: 1.05rem; margin-bottom: 24px;'>PitchAudit AI analyzes your deck against proven investor templates, flags gaps, and rewrites slides using your content. Get a readiness score, must‑fix checklist, and clean exports.</div>",
     unsafe_allow_html=True
 )
 
@@ -321,7 +360,7 @@ if start:
     # Remove the Start button and show a "Model is cooking…" label with a live progress bar
     start_placeholder.empty()
     cooking_text = st.empty()
-    cooking_text.markdown("<div style='text-align:center; color: rgba(49,51,63,.75); margin: 6px 0;'>Model is cooking…</div>", unsafe_allow_html=True)
+    cooking_text.markdown("<div style='text-align:center; color:#B7BEC9; margin: 6px 0;'>Model is cooking…</div>", unsafe_allow_html=True)
 
     files_payload: List[dict] = st.session_state.uploaded_payload or []
 
