@@ -12,7 +12,6 @@ import random
 import mimetypes
 import uuid
 import hashlib
-import re
 from typing import Generator, List, Optional
 
 import requests
@@ -207,274 +206,6 @@ def _infer_file_type(mime: str) -> str:
     return "document"
 
 
-# Structured query builder and renderer helpers
-def build_structured_query() -> str:
-    """
-    Ask Dify to return STRICT JSON that we can render into a clean, consistent layout.
-    This leaves your server-side workflow untouched and enforces a schema client-side.
-    """
-    schema = {
-        "one_line_verdict": {"status": "", "why": ""},
-        "does_well": [],
-        "must_fix_now": [],
-        "slides_to_add": [
-            {
-                "title": "",
-                "why": "",
-                "bullets": [],
-                "sources": []
-            }
-        ],
-        "slides_to_remove_or_merge": [],
-        "slides_to_change": [],
-        "numbers_consistency_check": [],
-        "action_plan": [],
-        "data_to_collect": []
-    }
-
-    # We instruct the model to output ONLY minified JSON for easy parsing.
-    return (
-        "You are Pitch Audit AI. Read the uploaded deck files and produce a rigorous audit. "
-        "Output ONLY MINIFIED JSON (no markdown, no prose) that exactly matches this schema keys: "
-        + json.dumps(schema, separators=(',', ':'))
-        + ". Populate all fields thoughtfully; use [] when unknown. DO NOT include backticks."
-    )
-
-
-def try_render_structured(raw_text: str) -> Optional[str]:
-    """
-    Attempt to parse the model output as JSON (even if it includes stray text/code fences),
-    and render a nicely structured Markdown block. Returns None if parsing fails.
-    """
-    # Strip any code fences
-    cleaned = raw_text.strip()
-    cleaned = cleaned.replace("```json", "").replace("```", "").strip()
-
-    # Extract the widest plausible JSON object
-    start = cleaned.find("{")
-    end = cleaned.rfind("}")
-    if start == -1 or end <= start:
-        return None
-
-    json_str = cleaned[start:end+1]
-    try:
-        data = json.loads(json_str)
-    except Exception:
-        return None
-
-    # Helper to bullet lists
-    def bullets(items):
-        if not items:
-            return "- _Not present_\n"
-        return "".join([f"- {str(x).strip()}\n" for x in items if str(x).strip()])
-
-    # Slides to add (numbered with inner bullets)
-    slides_md = ""
-    for i, s in enumerate(data.get("slides_to_add") or [], start=1):
-        title = (s or {}).get("title") or "Slide"
-        why = (s or {}).get("why") or ""
-        pts = (s or {}).get("bullets") or []
-        srcs = (s or {}).get("sources") or []
-        slides_md += f"\n{i}.\n\nSlide Name \"{title}\" Why\n\n"
-        if why:
-            slides_md += f"- {why}\n"
-        if pts:
-            for p in pts:
-                slides_md += f"- {p}\n"
-        if srcs:
-            slides_md += f"Sources: {', '.join([str(x) for x in srcs])}\n"
-
-    verdict = data.get("one_line_verdict") or {}
-    status = verdict.get("status") or "_Not stated_"
-    why_verdict = verdict.get("why") or "_Not stated_"
-
-    md = []
-    md.append("Thanks for uploading Pitch Deck, Model is cooking  \nPlease wait.")
-    md.append("")
-    md.append("You can also do your token audit using our Tokenomics Audit Tool: https://www.tokenomics.checker.tde.fi/")
-    md.append("")
-    md.append("Here's What our Model Thinks For  Pitch Deck:")
-    md.append(f"**{status}**")
-    md.append("")
-    md.append("**Reason**")
-    md.append(why_verdict)
-    md.append("")
-    md.append("**Strengths:**")
-    md.append(bullets(data.get("does_well")))
-    md.append("")
-    md.append("**Red Flags (High Priority Concerns):**")
-    md.append(bullets(data.get("must_fix_now")))
-    md.append("")
-    md.append("**Improvement Tips:**")
-    md.append("")
-    md.append("- **Add**")
-    md.append(bullets([(s.get("title") or "Slide") for s in (data.get("slides_to_add") or [])]))
-    md.append(slides_md if slides_md else "")
-    md.append("")
-    md.append("- **Remove / Merge**")
-    md.append(bullets(data.get("slides_to_remove_or_merge")))
-    md.append("")
-    md.append("- **Change**")
-    md.append(bullets(data.get("slides_to_change")))
-    md.append("")
-    md.append("**Consistency Check**")
-    md.append(bullets(data.get("numbers_consistency_check")))
-    md.append("")
-    md.append("**The Action Plan**")
-    md.append(bullets(data.get("action_plan")))
-    md.append("")
-    md.append("**Data Points (Can Include):**")
-    md.append(bullets(data.get("data_to_collect")))
-    md.append("")
-    md.append("Scheduled a demo call with us for more insights:\n\nhttps://calendly.com/tdefi_project_calls/45min")
-
-    # Wrap in your result box
-    return "<div class='result-box'>" + "\n\n".join(md) + "</div>"
-
-
-# -----------------------------
-# Heuristic normalization of free-form Dify output to template
-# -----------------------------
-def normalize_to_template(raw_text: str) -> str:
-    """
-    Heuristically convert a free-form Dify answer into the standard, neat template.
-    We DO NOT change your workflow—this only post-processes whatever text Dify returns.
-    """
-    if not raw_text:
-        return ""
-
-    t = raw_text.replace("\r\n", "\n")
-    # Remove code fences if any
-    t = t.replace("```json", "").replace("```", "")
-
-    # Normalize bullets
-    bullet_chars = ["•", "◦", "–", "—", "·", "*", "↳", "»"]
-    for ch in bullet_chars:
-        t = t.replace(f"\n{ch} ", "\n- ")
-        t = t.replace(f"\n {ch} ", "\n- ")
-    # Ensure any remaining lines that begin with Unicode dashes are treated as '-'
-    t = re.sub(r"^\s*[–—]\s+", "- ", t, flags=re.MULTILINE)
-
-    # Section headers mapping
-    header_map = {
-        "verdict": re.compile(r"(?im)^\s*(one[-\s]?line\s+verdict|verdict|status)\s*[:\-]?\s*$"),
-        "reason": re.compile(r"(?im)^\s*(reason|why)\s*[:\-]?\s*$"),
-        "strengths": re.compile(r"(?im)^\s*(strengths|does\s*well|pros|advantages)\s*[:\-]?\s*$"),
-        "red_flags": re.compile(r"(?im)^\s*(red\s*flags?|high\s*priority\s*concerns|cons|risks|must\s*fix(\s*now)?)\s*[:\-]?\s*$"),
-        "add": re.compile(r"(?im)^\s*(slides?\s*to\s*add|add)\s*[:\-]?\s*$"),
-        "remove_merge": re.compile(r"(?im)^\s*(slides?\s*to\s*remove\s*/?\s*merge|remove\s*/?\s*merge|remove|merge)\s*[:\-]?\s*$"),
-        "change": re.compile(r"(?im)^\s*(slides?\s*to\s*change|change|tweaks?)\s*[:\-]?\s*$"),
-        "consistency": re.compile(r"(?im)^\s*(consistency\s*check|numbers\s*consistency|sanity\s*check)\s*[:\-]?\s*$"),
-        "action": re.compile(r"(?im)^\s*(the\s*action\s*plan|action\s*plan|next\s*steps|todo|to\-do)\s*[:\-]?\s*$"),
-        "data": re.compile(r"(?im)^\s*(data\s*points?(?:\s*\(can\s*include\))?|metrics\s*to\s*collect|evidence\s*to\s*collect)\s*[:\-]?\s*$"),
-        # Improvement subsections (nested)
-        "improvement": re.compile(r"(?im)^\s*(improvement\s*tips?)\s*[:\-]?\s*$"),
-        "impr_add": re.compile(r"(?im)^\s*(\-?\s*)?(add)\s*[:\-]?\s*$"),
-        "impr_remove": re.compile(r"(?im)^\s*(\-?\s*)?(remove\s*/?\s*merge|remove|merge)\s*[:\-]?\s*$"),
-        "impr_change": re.compile(r"(?im)^\s*(\-?\s*)?(change|tweaks?)\s*[:\-]?\s*$"),
-    }
-
-    # State accumulators
-    sections = {
-        "verdict": [],
-        "reason": [],
-        "strengths": [],
-        "red_flags": [],
-        "add": [],
-        "remove_merge": [],
-        "change": [],
-        "consistency": [],
-        "action": [],
-        "data": [],
-    }
-
-    current = None
-    impr_mode = None  # which of add/remove/change inside Improvement Tips
-
-    for line in t.split("\n"):
-        ln = line.strip()
-        if not ln:
-            continue
-
-        # Check for top-level headers
-        matched_header = False
-        for key, rx in header_map.items():
-            if key.startswith("impr_") or key == "improvement":
-                continue
-            if rx.match(ln):
-                current = key
-                impr_mode = None
-                matched_header = True
-                break
-        if matched_header:
-            continue
-
-        # Improvement tips group
-        if header_map["improvement"].match(ln):
-            current = "add"  # default to add until we hit a subheader
-            impr_mode = "add"
-            continue
-        if header_map["impr_add"].match(ln):
-            current = "add"
-            impr_mode = "add"
-            continue
-        if header_map["impr_remove"].match(ln):
-            current = "remove_merge"
-            impr_mode = "remove_merge"
-            continue
-        if header_map["impr_change"].match(ln):
-            current = "change"
-            impr_mode = "change"
-            continue
-
-        # Bucket bullets vs paragraphs
-        if ln.startswith("- "):
-            bucket = current or ("strengths" if not sections["strengths"] else "red_flags")
-            sections[bucket].append(ln[2:].strip())
-        else:
-            # If this looks like "Status: XYZ" capture as verdict
-            m = re.match(r"(?i)^\s*(status|verdict)\s*:\s*(.+)$", ln)
-            if m:
-                sections["verdict"].append(m.group(2).strip())
-            else:
-                # Non-bulleted text — prefer Reason if empty, else Action
-                target = "reason" if not sections["reason"] else "action"
-                sections[target].append(ln)
-
-    # Build the final markdown using the template the user provided
-    def bullets_md(items):
-        if not items:
-            return "- _Not present_\n"
-        return "".join([f"- {x}\n" for x in items])
-
-    verdict_line = sections["verdict"][0] if sections["verdict"] else "_Not stated_"
-    reason_text = "\n".join(sections["reason"]) if sections["reason"] else "_Not stated_"
-
-    md = []
-    md.append("Thanks for uploading Pitch Deck, Model is cooking  \nPlease wait.\n")
-    md.append("You can also do your token audit using our Tokenomics Audit Tool: https://www.tokenomics.checker.tde.fi/\n")
-    md.append("Here's What our Model Thinks For  Pitch Deck:\n")
-    md.append(f"**{verdict_line}**\n")
-    md.append("**Reason**\n")
-    md.append(f"{reason_text}\n")
-    md.append("**Strengths:**\n")
-    md.append(bullets_md(sections["strengths"]))
-    md.append("\n**Red Flags(High Priority Concerns) :**\n")
-    md.append(bullets_md(sections["red_flags"]))
-    md.append("\n**Improvement Tips:**\n\n- **Add**\n")
-    md.append(bullets_md(sections["add"]))
-    md.append("\n- **Remove / Merge**\n")
-    md.append(bullets_md(sections["remove_merge"]))
-    md.append("\n- **Change**\n")
-    md.append(bullets_md(sections["change"]))
-    md.append("\n**Consistency Check**\n")
-    md.append(bullets_md(sections["consistency"]))
-    md.append("\n**The Action Plan**\n")
-    md.append(bullets_md(sections["action"]))
-    md.append("\n**Data Points (Can Include):**\n")
-    md.append(bullets_md(sections["data"]))
-    md.append("\nScheduled a demo call with us for more insights:\n\nhttps://calendly.com/tdefi_project_calls/45min")
-    return "<div class='result-box'>" + "\n".join(md) + "</div>"
 
 
 def dify_upload_file(file_name: str, file_bytes: bytes, mime: Optional[str], user: str) -> str:
@@ -519,35 +250,16 @@ def dify_stream_chat(query: str, files_payload: Optional[List[dict]], user: str)
                 evt = json.loads(data_str)
             except Exception:
                 continue
-
             conv_id = evt.get("conversation_id")
             if conv_id and not st.session_state.conversation_id:
                 st.session_state.conversation_id = conv_id
-
             event_type = evt.get("event")
-            # Common incremental tokens
-            if event_type in ("message", "agent_message", "tool_message", "message_delta"):
-                delta = (
-                    evt.get("answer")
-                    or evt.get("output_text")
-                    or evt.get("data")  # sometimes dify nests text in data
-                    or ""
-                )
-                if isinstance(delta, dict):
-                    # best effort: try common keys
-                    delta = delta.get("text") or delta.get("content") or ""
+            if event_type in ("message", "agent_message", "tool_message"):
+                delta = evt.get("answer") or evt.get("output_text") or ""
                 if delta:
-                    yield str(delta)
-
-            # Some Dify deployments only send the final text on *_end or completed events.
+                    yield delta
             elif event_type in ("message_end", "agent_message_end", "completed", "workflow_finished"):
-                final_ans = evt.get("answer") or evt.get("output_text") or ""
-                if isinstance(final_ans, dict):
-                    final_ans = final_ans.get("text") or final_ans.get("content") or ""
-                if final_ans:
-                    yield str(final_ans)
                 break
-
             elif event_type == "error":
                 err_msg = evt.get("message") or evt.get("error") or "Model error"
                 raise RuntimeError(err_msg)
@@ -663,44 +375,32 @@ if start:
 
     files_payload: List[dict] = st.session_state.uploaded_payload or []
 
-    # Ask for structured JSON so we can render a consistent layout
     RANDOM_QUERIES = [
         "Scan this pitch deck and give a crisp summary (company, problem, solution, traction, ask).",
         "Extract key metrics, GTM, business model, competitors and risks from this deck.",
         "Summarize the opportunity, product, moat, and top 5 red flags in this deck.",
         "Create a bullet summary of team, roadmap, market size, business model and funding ask.",
     ]
-    query = RANDOM_QUERIES[0]
+    query = random.choice(RANDOM_QUERIES)
 
     try:
         # Visual progress bar while the model is generating; fills to 90% gradually and 100% at completion.
         prog_slot = st.empty()
         prog = prog_slot.progress(0)
 
-        raw_chunks = []
-        pct = 0
-        for chunk in dify_stream_chat(query, files_payload or None, st.session_state.dify_user):
-            raw_chunks.append(chunk)
-            pct = min(90, pct + 2)
-            prog.progress(pct)
+        def _with_progress(gen):
+            pct = 0
+            for chunk in gen:
+                pct = min(90, pct + 2)
+                prog.progress(pct)
+                yield chunk
+            prog.progress(100)
 
-        prog.progress(100)
+        final_text = st.write_stream(_with_progress(dify_stream_chat(query, files_payload or None, st.session_state.dify_user)))
+        # clear the progress UI once complete
         prog_slot.empty()
         cooking_text.empty()
-
-        raw_text = "".join(raw_chunks)
-
-        # Try to render the structured JSON; if it fails, heuristically structure the free-form text;
-        # if that also fails, fall back to raw.
-        structured_md = try_render_structured(raw_text)
-        if not structured_md:
-            structured_md = normalize_to_template(raw_text)
-        if structured_md:
-            st.markdown(structured_md, unsafe_allow_html=True)
-            st.session_state.last_output = structured_md
-        else:
-            st.markdown(f"<div class='result-box'>{raw_text}</div>", unsafe_allow_html=True)
-            st.session_state.last_output = raw_text
+        st.session_state.last_output = final_text
     except Exception as e:
         st.error("Model is sleeping 😴. Try to reload the app.")
         with st.expander("Show technical details", expanded=False):
@@ -708,4 +408,4 @@ if start:
 
 # Show last output if present (after rerun etc.)
 if st.session_state.get("last_output") and not start:
-    st.markdown(f"{st.session_state.last_output}", unsafe_allow_html=True)
+    st.markdown(f"<div class='result-box'>{st.session_state.last_output}</div>", unsafe_allow_html=True)
