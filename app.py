@@ -12,6 +12,7 @@ import random
 import mimetypes
 import uuid
 import hashlib
+import re
 from typing import Generator, List, Optional
 
 import requests
@@ -193,6 +194,7 @@ def _headers(json_mode: bool = True) -> dict:
     return h
 
 
+
 def _infer_file_type(mime: str) -> str:
     if not mime:
         return "document"
@@ -203,6 +205,131 @@ def _infer_file_type(mime: str) -> str:
     if mime.startswith("video/"):
         return "video"
     return "document"
+
+
+# Structured query builder and renderer helpers
+def build_structured_query() -> str:
+    """
+    Ask Dify to return STRICT JSON that we can render into a clean, consistent layout.
+    This leaves your server-side workflow untouched and enforces a schema client-side.
+    """
+    schema = {
+        "one_line_verdict": {"status": "", "why": ""},
+        "does_well": [],
+        "must_fix_now": [],
+        "slides_to_add": [
+            {
+                "title": "",
+                "why": "",
+                "bullets": [],
+                "sources": []
+            }
+        ],
+        "slides_to_remove_or_merge": [],
+        "slides_to_change": [],
+        "numbers_consistency_check": [],
+        "action_plan": [],
+        "data_to_collect": []
+    }
+
+    # We instruct the model to output ONLY minified JSON for easy parsing.
+    return (
+        "You are Pitch Audit AI. Read the uploaded deck files and produce a rigorous audit. "
+        "Output ONLY MINIFIED JSON (no markdown, no prose) that exactly matches this schema keys: "
+        + json.dumps(schema, separators=(',', ':'))
+        + ". Populate all fields thoughtfully; use [] when unknown. DO NOT include backticks."
+    )
+
+
+def try_render_structured(raw_text: str) -> Optional[str]:
+    """
+    Attempt to parse the model output as JSON (even if it includes stray text/code fences),
+    and render a nicely structured Markdown block. Returns None if parsing fails.
+    """
+    # Strip any code fences
+    cleaned = raw_text.strip()
+    cleaned = cleaned.replace("```json", "").replace("```", "").strip()
+
+    # Extract the widest plausible JSON object
+    start = cleaned.find("{")
+    end = cleaned.rfind("}")
+    if start == -1 or end <= start:
+        return None
+
+    json_str = cleaned[start:end+1]
+    try:
+        data = json.loads(json_str)
+    except Exception:
+        return None
+
+    # Helper to bullet lists
+    def bullets(items):
+        if not items:
+            return "- _Not present_\n"
+        return "".join([f"- {str(x).strip()}\n" for x in items if str(x).strip()])
+
+    # Slides to add (numbered with inner bullets)
+    slides_md = ""
+    for i, s in enumerate(data.get("slides_to_add") or [], start=1):
+        title = (s or {}).get("title") or "Slide"
+        why = (s or {}).get("why") or ""
+        pts = (s or {}).get("bullets") or []
+        srcs = (s or {}).get("sources") or []
+        slides_md += f"\n{i}.\n\nSlide Name \"{title}\" Why\n\n"
+        if why:
+            slides_md += f"- {why}\n"
+        if pts:
+            for p in pts:
+                slides_md += f"- {p}\n"
+        if srcs:
+            slides_md += f"Sources: {', '.join([str(x) for x in srcs])}\n"
+
+    verdict = data.get("one_line_verdict") or {}
+    status = verdict.get("status") or "_Not stated_"
+    why_verdict = verdict.get("why") or "_Not stated_"
+
+    md = []
+    md.append("Thanks for uploading Pitch Deck, Model is cooking  \nPlease wait.")
+    md.append("")
+    md.append("You can also do your token audit using our Tokenomics Audit Tool: https://www.tokenomics.checker.tde.fi/")
+    md.append("")
+    md.append("Here's What our Model Thinks For  Pitch Deck:")
+    md.append(f"**{status}**")
+    md.append("")
+    md.append("**Reason**")
+    md.append(why_verdict)
+    md.append("")
+    md.append("**Strengths:**")
+    md.append(bullets(data.get("does_well")))
+    md.append("")
+    md.append("**Red Flags (High Priority Concerns):**")
+    md.append(bullets(data.get("must_fix_now")))
+    md.append("")
+    md.append("**Improvement Tips:**")
+    md.append("")
+    md.append("- **Add**")
+    md.append(bullets([(s.get("title") or "Slide") for s in (data.get("slides_to_add") or [])]))
+    md.append(slides_md if slides_md else "")
+    md.append("")
+    md.append("- **Remove / Merge**")
+    md.append(bullets(data.get("slides_to_remove_or_merge")))
+    md.append("")
+    md.append("- **Change**")
+    md.append(bullets(data.get("slides_to_change")))
+    md.append("")
+    md.append("**Consistency Check**")
+    md.append(bullets(data.get("numbers_consistency_check")))
+    md.append("")
+    md.append("**The Action Plan**")
+    md.append(bullets(data.get("action_plan")))
+    md.append("")
+    md.append("**Data Points (Can Include):**")
+    md.append(bullets(data.get("data_to_collect")))
+    md.append("")
+    md.append("Scheduled a demo call with us for more insights:\n\nhttps://calendly.com/tdefi_project_calls/45min")
+
+    # Wrap in your result box
+    return "<div class='result-box'>" + "\n\n".join(md) + "</div>"
 
 
 def dify_upload_file(file_name: str, file_bytes: bytes, mime: Optional[str], user: str) -> str:
@@ -372,32 +499,36 @@ if start:
 
     files_payload: List[dict] = st.session_state.uploaded_payload or []
 
-    RANDOM_QUERIES = [
-        "Scan this pitch deck and give a crisp summary (company, problem, solution, traction, ask).",
-        "Extract key metrics, GTM, business model, competitors and risks from this deck.",
-        "Summarize the opportunity, product, moat, and top 5 red flags in this deck.",
-        "Create a bullet summary of team, roadmap, market size, business model and funding ask.",
-    ]
-    query = random.choice(RANDOM_QUERIES)
+    # Ask for structured JSON so we can render a consistent layout
+    query = build_structured_query()
 
     try:
         # Visual progress bar while the model is generating; fills to 90% gradually and 100% at completion.
         prog_slot = st.empty()
         prog = prog_slot.progress(0)
 
-        def _with_progress(gen):
-            pct = 0
-            for chunk in gen:
-                pct = min(90, pct + 2)
-                prog.progress(pct)
-                yield chunk
-            prog.progress(100)
+        raw_chunks = []
+        pct = 0
+        for chunk in dify_stream_chat(query, files_payload or None, st.session_state.dify_user):
+            raw_chunks.append(chunk)
+            pct = min(90, pct + 2)
+            prog.progress(pct)
 
-        final_text = st.write_stream(_with_progress(dify_stream_chat(query, files_payload or None, st.session_state.dify_user)))
-        # clear the progress UI once complete
+        prog.progress(100)
         prog_slot.empty()
         cooking_text.empty()
-        st.session_state.last_output = final_text
+
+        raw_text = "".join(raw_chunks)
+
+        # Try to render the structured JSON; if it fails, fall back to raw text.
+        structured_md = try_render_structured(raw_text)
+        if structured_md:
+            st.markdown(structured_md, unsafe_allow_html=True)
+            st.session_state.last_output = structured_md
+        else:
+            # Fallback: show whatever came back
+            st.markdown(f"<div class='result-box'>{raw_text}</div>", unsafe_allow_html=True)
+            st.session_state.last_output = raw_text
     except Exception as e:
         st.error("Model is sleeping 😴. Try to reload the app.")
         with st.expander("Show technical details", expanded=False):
@@ -405,6 +536,4 @@ if start:
 
 # Show last output if present (after rerun etc.)
 if st.session_state.get("last_output") and not start:
-    st.markdown(f"<div class='result-box'>{st.session_state.last_output}</div>", unsafe_allow_html=True)
-
-
+    st.markdown(f"{st.session_state.last_output}", unsafe_allow_html=True)
