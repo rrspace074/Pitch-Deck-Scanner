@@ -332,6 +332,151 @@ def try_render_structured(raw_text: str) -> Optional[str]:
     return "<div class='result-box'>" + "\n\n".join(md) + "</div>"
 
 
+# -----------------------------
+# Heuristic normalization of free-form Dify output to template
+# -----------------------------
+def normalize_to_template(raw_text: str) -> str:
+    """
+    Heuristically convert a free-form Dify answer into the standard, neat template.
+    We DO NOT change your workflow—this only post-processes whatever text Dify returns.
+    """
+    if not raw_text:
+        return ""
+
+    t = raw_text.replace("\r\n", "\n")
+    # Remove code fences if any
+    t = t.replace("```json", "").replace("```", "")
+
+    # Normalize bullets
+    bullet_chars = ["•", "◦", "–", "—", "·", "*", "↳", "»"]
+    for ch in bullet_chars:
+        t = t.replace(f"\n{ch} ", "\n- ")
+        t = t.replace(f"\n {ch} ", "\n- ")
+    # Ensure any remaining lines that begin with Unicode dashes are treated as '-'
+    t = re.sub(r"^\s*[–—]\s+", "- ", t, flags=re.MULTILINE)
+
+    # Section headers mapping
+    header_map = {
+        "verdict": re.compile(r"(?im)^\s*(one[-\s]?line\s+verdict|verdict|status)\s*[:\-]?\s*$"),
+        "reason": re.compile(r"(?im)^\s*(reason|why)\s*[:\-]?\s*$"),
+        "strengths": re.compile(r"(?im)^\s*(strengths|does\s*well|pros|advantages)\s*[:\-]?\s*$"),
+        "red_flags": re.compile(r"(?im)^\s*(red\s*flags?|high\s*priority\s*concerns|cons|risks|must\s*fix(\s*now)?)\s*[:\-]?\s*$"),
+        "add": re.compile(r"(?im)^\s*(slides?\s*to\s*add|add)\s*[:\-]?\s*$"),
+        "remove_merge": re.compile(r"(?im)^\s*(slides?\s*to\s*remove\s*/?\s*merge|remove\s*/?\s*merge|remove|merge)\s*[:\-]?\s*$"),
+        "change": re.compile(r"(?im)^\s*(slides?\s*to\s*change|change|tweaks?)\s*[:\-]?\s*$"),
+        "consistency": re.compile(r"(?im)^\s*(consistency\s*check|numbers\s*consistency|sanity\s*check)\s*[:\-]?\s*$"),
+        "action": re.compile(r"(?im)^\s*(the\s*action\s*plan|action\s*plan|next\s*steps|todo|to\-do)\s*[:\-]?\s*$"),
+        "data": re.compile(r"(?im)^\s*(data\s*points?(?:\s*\(can\s*include\))?|metrics\s*to\s*collect|evidence\s*to\s*collect)\s*[:\-]?\s*$"),
+        # Improvement subsections (nested)
+        "improvement": re.compile(r"(?im)^\s*(improvement\s*tips?)\s*[:\-]?\s*$"),
+        "impr_add": re.compile(r"(?im)^\s*(\-?\s*)?(add)\s*[:\-]?\s*$"),
+        "impr_remove": re.compile(r"(?im)^\s*(\-?\s*)?(remove\s*/?\s*merge|remove|merge)\s*[:\-]?\s*$"),
+        "impr_change": re.compile(r"(?im)^\s*(\-?\s*)?(change|tweaks?)\s*[:\-]?\s*$"),
+    }
+
+    # State accumulators
+    sections = {
+        "verdict": [],
+        "reason": [],
+        "strengths": [],
+        "red_flags": [],
+        "add": [],
+        "remove_merge": [],
+        "change": [],
+        "consistency": [],
+        "action": [],
+        "data": [],
+    }
+
+    current = None
+    impr_mode = None  # which of add/remove/change inside Improvement Tips
+
+    for line in t.split("\n"):
+        ln = line.strip()
+        if not ln:
+            continue
+
+        # Check for top-level headers
+        matched_header = False
+        for key, rx in header_map.items():
+            if key.startswith("impr_") or key == "improvement":
+                continue
+            if rx.match(ln):
+                current = key
+                impr_mode = None
+                matched_header = True
+                break
+        if matched_header:
+            continue
+
+        # Improvement tips group
+        if header_map["improvement"].match(ln):
+            current = "add"  # default to add until we hit a subheader
+            impr_mode = "add"
+            continue
+        if header_map["impr_add"].match(ln):
+            current = "add"
+            impr_mode = "add"
+            continue
+        if header_map["impr_remove"].match(ln):
+            current = "remove_merge"
+            impr_mode = "remove_merge"
+            continue
+        if header_map["impr_change"].match(ln):
+            current = "change"
+            impr_mode = "change"
+            continue
+
+        # Bucket bullets vs paragraphs
+        if ln.startswith("- "):
+            bucket = current or ("strengths" if not sections["strengths"] else "red_flags")
+            sections[bucket].append(ln[2:].strip())
+        else:
+            # If this looks like "Status: XYZ" capture as verdict
+            m = re.match(r"(?i)^\s*(status|verdict)\s*:\s*(.+)$", ln)
+            if m:
+                sections["verdict"].append(m.group(2).strip())
+            else:
+                # Non-bulleted text — prefer Reason if empty, else Action
+                target = "reason" if not sections["reason"] else "action"
+                sections[target].append(ln)
+
+    # Build the final markdown using the template the user provided
+    def bullets_md(items):
+        if not items:
+            return "- _Not present_\n"
+        return "".join([f"- {x}\n" for x in items])
+
+    verdict_line = sections["verdict"][0] if sections["verdict"] else "_Not stated_"
+    reason_text = "\n".join(sections["reason"]) if sections["reason"] else "_Not stated_"
+
+    md = []
+    md.append("Thanks for uploading Pitch Deck, Model is cooking  \nPlease wait.\n")
+    md.append("You can also do your token audit using our Tokenomics Audit Tool: https://www.tokenomics.checker.tde.fi/\n")
+    md.append("Here's What our Model Thinks For  Pitch Deck:\n")
+    md.append(f"**{verdict_line}**\n")
+    md.append("**Reason**\n")
+    md.append(f"{reason_text}\n")
+    md.append("**Strengths:**\n")
+    md.append(bullets_md(sections["strengths"]))
+    md.append("\n**Red Flags(High Priority Concerns) :**\n")
+    md.append(bullets_md(sections["red_flags"]))
+    md.append("\n**Improvement Tips:**\n\n- **Add**\n")
+    md.append(bullets_md(sections["add"]))
+    md.append("\n- **Remove / Merge**\n")
+    md.append(bullets_md(sections["remove_merge"]))
+    md.append("\n- **Change**\n")
+    md.append(bullets_md(sections["change"]))
+    md.append("\n**Consistency Check**\n")
+    md.append(bullets_md(sections["consistency"]))
+    md.append("\n**The Action Plan**\n")
+    md.append(bullets_md(sections["action"]))
+    md.append("\n**Data Points (Can Include):**\n")
+    md.append(bullets_md(sections["data"]))
+    md.append("\nScheduled a demo call with us for more insights:\n\nhttps://calendly.com/tdefi_project_calls/45min")
+    return "<div class='result-box'>" + "\n".join(md) + "</div>"
+
+
 def dify_upload_file(file_name: str, file_bytes: bytes, mime: Optional[str], user: str) -> str:
     """Upload a file to Dify for this conversation; returns upload_file_id."""
     url = f"{API_BASE}/files/upload"
@@ -519,7 +664,13 @@ if start:
     files_payload: List[dict] = st.session_state.uploaded_payload or []
 
     # Ask for structured JSON so we can render a consistent layout
-    query = build_structured_query()
+    RANDOM_QUERIES = [
+        "Scan this pitch deck and give a crisp summary (company, problem, solution, traction, ask).",
+        "Extract key metrics, GTM, business model, competitors and risks from this deck.",
+        "Summarize the opportunity, product, moat, and top 5 red flags in this deck.",
+        "Create a bullet summary of team, roadmap, market size, business model and funding ask.",
+    ]
+    query = RANDOM_QUERIES[0]
 
     try:
         # Visual progress bar while the model is generating; fills to 90% gradually and 100% at completion.
@@ -539,13 +690,15 @@ if start:
 
         raw_text = "".join(raw_chunks)
 
-        # Try to render the structured JSON; if it fails, fall back to raw text.
+        # Try to render the structured JSON; if it fails, heuristically structure the free-form text;
+        # if that also fails, fall back to raw.
         structured_md = try_render_structured(raw_text)
+        if not structured_md:
+            structured_md = normalize_to_template(raw_text)
         if structured_md:
             st.markdown(structured_md, unsafe_allow_html=True)
             st.session_state.last_output = structured_md
         else:
-            # Fallback: show whatever came back
             st.markdown(f"<div class='result-box'>{raw_text}</div>", unsafe_allow_html=True)
             st.session_state.last_output = raw_text
     except Exception as e:
