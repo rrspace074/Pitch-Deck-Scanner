@@ -294,8 +294,6 @@ def _restructure_with_openai(text: str) -> str:
     - Caps output length heuristically to avoid waste
     Returns original text on any failure.
     """
-    if not OPENAI_KEY:
-        return text
     # Heuristic: allow ~25% fewer chars than input as max output tokens estimate
     # Token ~= 4 chars; keep floor/ceiling to be safe.
     approx_tokens = max(256, min(2048, max(300, len(text) // 4)))
