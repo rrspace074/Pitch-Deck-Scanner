@@ -4,7 +4,7 @@
 #   NEXT_PUBLIC_API_URL   (default: https://api.dify.ai/v1)
 #   NEXT_PUBLIC_APP_KEY   (required)
 #   NEXT_PUBLIC_APP_ID    (optional)
-#   OPENAI_API_KEY        (optional; if set, used to minimally reformat Dify output)
+#   OPENAI_API_KEY        (required; used to minimally reformat Dify output)
 
 import os
 import json
@@ -181,11 +181,13 @@ with st.sidebar:
     # Info line under the button
     st.markdown("<div style='display:flex;align-items:center;gap:8px;color:#B7BEC9;font-size:0.9rem;'>ℹ️ <span>Reload if it doesn't respond in 60 sec.</span></div>", unsafe_allow_html=True)
 
-# Safety check for key (no sidebar inputs anymore)
+# Safety check for keys (required)
 if not API_KEY:
-    st.warning("Set NEXT_PUBLIC_APP_KEY as an environment variable or in .streamlit/secrets.toml to use the app.")
-if OPENAI_KEY:
-    st.caption("OpenAI post-processing enabled: output will be lightly structured.")
+    st.error("NEXT_PUBLIC_APP_KEY is required. Set it in your environment or .streamlit/secrets.toml.")
+    st.stop()
+if not OPENAI_KEY:
+    st.error("OPENAI_API_KEY is required for post-processing. Set it in your environment or .streamlit/secrets.toml.")
+    st.stop()
 
 # -----------------------------
 # Dify HTTP helpers
@@ -287,12 +289,11 @@ def dify_stream_chat(query: str, files_payload: Optional[List[dict]], user: str)
 # OpenAI minimal post-processor
 # -----------------------------
 
-def _restructure_with_openai(text: str) -> str:
+def _restructure_with_openai(text: str) -> Optional[str]:
     """Lightly restructure text via OpenAI with minimal tokens.
     - Keeps wording; only adds headings/bullets
     - Uses cheap model and low temperature
     - Caps output length heuristically to avoid waste
-    Returns original text on any failure.
     """
     # Heuristic: allow ~25% fewer chars than input as max output tokens estimate
     # Token ~= 4 chars; keep floor/ceiling to be safe.
@@ -319,19 +320,19 @@ def _restructure_with_openai(text: str) -> str:
             timeout=60,
         )
         if resp.status_code >= 400:
-            return text
+            return None
         j = resp.json()
         choice = (j.get("choices") or [{}])[0]
         content = (
             ((choice.get("message") or {}).get("content"))
-            or text
+            or None
         )
-        # Basic sanity: if model echoed too little, fall back
+        # Basic sanity: must have some content
         if content and len(content.strip()) > 0:
             return content
-        return text
+        return None
     except Exception:
-        return text
+        return None
 
 # -----------------------------
 # Minimal single-shot UI with pre-upload + progress
@@ -457,26 +458,26 @@ if start:
         prog_slot = st.empty()
         prog = prog_slot.progress(0)
 
-        def _with_progress(gen):
-            pct = 0
-            for chunk in gen:
-                pct = min(90, pct + 2)
-                prog.progress(pct)
-                yield chunk
-            prog.progress(100)
+        # Consume Dify stream silently, only track progress; do not display raw output
+        final_chunks: List[str] = []
+        pct = 0
+        for chunk in dify_stream_chat(query, files_payload or None, st.session_state.dify_user):
+            pct = min(90, pct + 2)
+            prog.progress(pct)
+            final_chunks.append(str(chunk))
+        prog.progress(100)
 
-        final_text = st.write_stream(_with_progress(dify_stream_chat(query, files_payload or None, st.session_state.dify_user)))
-        # After streaming, lightly restructure the final text using OpenAI (if key present)
-        if isinstance(final_text, str) and final_text.strip():
-            structured = _restructure_with_openai(final_text)
-            final_text = structured or final_text
+        final_text = "".join(final_chunks).strip()
+        # Restructure strictly via OpenAI (mandatory)
+        structured = _restructure_with_openai(final_text)
+        if not structured:
+            raise RuntimeError("OpenAI post-processing failed or returned empty content.")
         # clear the progress UI once complete
         prog_slot.empty()
         cooking_text.empty()
-        st.session_state.last_output = final_text
-        # Show structured output in a styled box
-        if isinstance(final_text, str) and final_text.strip():
-            st.markdown(f"<div class='result-box'>{final_text}</div>", unsafe_allow_html=True)
+        st.session_state.last_output = structured
+        # Show only the OpenAI-structured output
+        st.markdown(f"<div class='result-box'>{structured}</div>", unsafe_allow_html=True)
     except Exception as e:
         st.error("Model is sleeping 😴. Try to reload the app.")
         with st.expander("Show technical details", expanded=False):
