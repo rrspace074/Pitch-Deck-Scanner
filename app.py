@@ -238,6 +238,7 @@ def dify_stream_chat(query: str, files_payload: Optional[List[dict]], user: str)
             except Exception:
                 err = r.text
             raise RuntimeError(f"{r.status_code}: {err}")
+        final_buffer = []
         for raw in r.iter_lines(decode_unicode=True):
             if not raw or raw.startswith(":"):
                 continue
@@ -254,11 +255,22 @@ def dify_stream_chat(query: str, files_payload: Optional[List[dict]], user: str)
             if conv_id and not st.session_state.conversation_id:
                 st.session_state.conversation_id = conv_id
             event_type = evt.get("event")
-            if event_type in ("message", "agent_message", "tool_message"):
-                delta = evt.get("answer") or evt.get("output_text") or ""
+            # Stream incremental tokens when available
+            if event_type in ("message", "agent_message", "tool_message", "message_delta"):
+                delta = (evt.get("answer") or evt.get("output_text") or evt.get("data") or "")
+                if isinstance(delta, dict):
+                    delta = delta.get("text") or delta.get("content") or ""
                 if delta:
-                    yield delta
+                    final_buffer.append(str(delta))
+                    yield str(delta)
             elif event_type in ("message_end", "agent_message_end", "completed", "workflow_finished"):
+                # Some Dify apps send only the final text on *_end events; make sure we surface it.
+                tail = (evt.get("answer") or evt.get("output_text") or "")
+                if isinstance(tail, dict):
+                    tail = tail.get("text") or tail.get("content") or ""
+                if tail:
+                    final_buffer.append(str(tail))
+                    yield str(tail)
                 break
             elif event_type == "error":
                 err_msg = evt.get("message") or evt.get("error") or "Model error"
