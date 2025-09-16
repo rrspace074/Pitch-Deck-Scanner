@@ -4,10 +4,10 @@
 #   NEXT_PUBLIC_API_URL   (default: https://api.dify.ai/v1)
 #   NEXT_PUBLIC_APP_KEY   (required)
 #   NEXT_PUBLIC_APP_ID    (optional)
+#   OPENAI_API_KEY        (required; used to minimally reformat Dify output)
 
 import os
 import json
-import re
 import base64
 import random
 import mimetypes
@@ -17,6 +17,9 @@ from typing import Generator, List, Optional
 
 import requests
 import streamlit as st
+
+# For OpenAI post-processing (use requests; no extra deps)
+import time
 
 # -----------------------------
 # Config & helpers
@@ -181,6 +184,7 @@ with st.sidebar:
 if not API_KEY:
     st.error("NEXT_PUBLIC_APP_KEY is required. Set it in your environment or .streamlit/secrets.toml.")
     st.stop()
+# No OpenAI dependency — all formatting is done locally
 
 # -----------------------------
 # Dify HTTP helpers
@@ -279,86 +283,149 @@ def dify_stream_chat(query: str, files_payload: Optional[List[dict]], user: str)
                 raise RuntimeError(err_msg)
 
 # -----------------------------
-# Local post-processor to structure raw text
+# Local Dify-output formatter -> Markdown
 # -----------------------------
 
+import re
 
-def _looks_like_markdown(text: str) -> bool:
-    if not text:
-        return False
-    if "```" in text or re.search(r"(^|\n)\s*#{1,6}\s", text):
-        return True
-    if re.search(r"(^|\n)\s*(?:[-*•]|\d+\.)\s+", text):
-        return True
-    return False
+def _clean_lines(text: str) -> List[str]:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Normalize bullets and dashes
+    text = text.replace("•", "-").replace("–", "-").replace("—", "-")
+    # Collapse repeated blank lines
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    lines = [ln.strip() for ln in text.split("\n")] 
+    return lines
 
+SECTION_TITLES = [
+    "Thanks for uploading",
+    "Here's What our Model Thinks",
+    "Reason",
+    "Strengths",
+    "Red Flags",
+    "Red Flags(High Priority Concerns)",
+    "Improvement Tips",
+    "Remove / Merge",
+    "Change",
+    "Consistency Check",
+    "The Action Plan",
+    "Data Points",
+    "Data Points (Can Include)",
+    "Schedule a Demo Call",
+]
 
-def _split_sentences(line: str) -> List[str]:
-    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", line.strip())
-    return [p.strip() for p in parts if p.strip()]
+def _is_section_title(line: str) -> Optional[str]:
+    lower = line.lower().strip(': ')
+    for title in SECTION_TITLES:
+        if lower.startswith(title.lower().strip(': ')):
+            return title
+    # Heuristic: standalone line in Title Case without trailing punctuation
+    if len(line.split()) <= 8 and line.istitle():
+        return line
+    return None
 
-
-def _format_line_to_markdown(line: str) -> List[str]:
-    line = line.strip()
-    if not line:
-        return []
-    if line.startswith(tuple("-*•–")) or re.match(r"^\d+\.\s+", line):
-        cleaned = re.sub(r"^[\-*•–\d\.\s]+", "", line)
-        return [f"- {cleaned.strip()}"]
-    if ":" in line:
-        key, value = line.split(":", 1)
-        if len(key.strip()) <= 40:
-            return [f"- **{key.strip()}:** {value.strip()}"]
-    if ";" in line and not line.endswith(";"):
-        parts = [part.strip() for part in line.split(";") if part.strip()]
-        if len(parts) > 1:
-            return [f"- {part}" for part in parts]
-    sentences = _split_sentences(line)
-    if len(sentences) > 1:
-        return [f"- {sentence}" for sentence in sentences]
-    return [f"- {line}"]
-
-
-def _format_output(text: str) -> str:
-    """Format raw Dify text into lightweight Markdown locally."""
-    if not text:
-        return ""
-    if _looks_like_markdown(text):
-        return text
-
-    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
-    formatted_sections: List[str] = []
-
-    for para in paragraphs:
-        lines = [line.strip() for line in para.splitlines() if line.strip()]
-        if not lines:
+def _render_slide_block(block_lines: List[str]) -> str:
+    # Expect keys like Slide Name, Why, Bullets, Sources
+    out = []
+    cur = {}
+    bullets: List[str] = []
+    for ln in block_lines:
+        if re.match(r"^Slide\s*Name", ln, flags=re.I):
+            if cur or bullets:
+                # flush previous
+                if bullets:
+                    cur["Bullets"] = bullets[:]
+                    bullets.clear()
+                out.append(_render_slide(cur))
+                cur = {}
+            val = ln.split("Slide",1)[1]
+            val = val.split("Name",1)[-1]
+            val = val.replace(":", "").strip().strip('"')
+            cur["Slide Name"] = val
+        elif re.match(r"^Why", ln, flags=re.I):
+            cur["Why"] = ln.split(":",1)[-1].strip().strip('"') if ":" in ln else ln[3:].strip().strip('"')
+        elif re.match(r"^New\s*Title", ln, flags=re.I):
+            cur["New Title"] = ln.split(":",1)[-1].strip().strip('"') if ":" in ln else ln.split("New",1)[-1].strip().strip('"')
+        elif re.match(r"^Sources?", ln, flags=re.I):
+            cur["Sources"] = ln.split(":",1)[-1].strip().strip('"') if ":" in ln else ln
+        elif re.match(r"^(Bullets?)$", ln, flags=re.I):
             continue
+        elif re.match(r"^[\-\*\u2022]", ln) or re.match(r"^\d+\.", ln):
+            bullets.append(re.sub(r"^\d+\.\s*", "", ln).lstrip("-*").strip())
+        elif ln:
+            # Treat as free text; append to Why if present else Notes
+            key = "Why" if "Why" in cur else "Notes"
+            cur[key] = (cur.get(key, "") + (" " if cur.get(key) else "") + ln).strip()
+    if cur or bullets:
+        if bullets:
+            cur["Bullets"] = bullets
+        out.append(_render_slide(cur))
+    return "\n\n".join([o for o in out if o])
 
-        heading = None
-        body_lines = lines
+def _render_slide(data: dict) -> str:
+    title = data.get("Slide Name") or data.get("Title") or "Slide"
+    parts = [f"- **Slide Name**: {title}"]
+    if data.get("New Title"):
+        parts.append(f"- **New Title**: {data['New Title']}")
+    if data.get("Why"):
+        parts.append(f"- **Why**: {data['Why']}")
+    if data.get("Bullets"):
+        for b in data["Bullets"]:
+            parts.append(f"  - {b}")
+    if data.get("Sources"):
+        parts.append(f"- **Sources**: {data['Sources']}")
+    if data.get("Notes"):
+        parts.append(f"- **Notes**: {data['Notes']}")
+    return "\n".join(parts)
 
-        first = lines[0]
-        if len(lines) > 1:
-            if first.endswith(":"):
-                heading = first[:-1].strip()
-                body_lines = lines[1:]
-            elif len(first) <= 60 and first[0].isalpha() and first == first.title():
-                heading = first
-                body_lines = lines[1:]
+def _format_block_as_list(block_lines: List[str]) -> str:
+    out = []
+    for ln in block_lines:
+        if not ln:
+            continue
+        if re.match(r"^[\-\*]", ln):
+            out.append(f"- {ln.lstrip('-* ').strip()}")
+        elif re.match(r"^\d+\.", ln):
+            out.append(re.sub(r"^(\d+)\.\s*", r"1. ", ln))
+        else:
+            out.append(ln)
+    return "\n".join(out)
 
-        section_parts: List[str] = []
-        if heading:
-            section_parts.append(f"### {heading}")
+def format_dify_output(text: str) -> str:
+    lines = _clean_lines(text)
+    # Split into sections
+    sections = []  # (title, lines)
+    cur_title = None
+    cur_lines: List[str] = []
+    for ln in lines:
+        title = _is_section_title(ln)
+        if title and (not cur_title or ln.lower().startswith(title.lower())):
+            if cur_title or cur_lines:
+                sections.append((cur_title, cur_lines))
+            cur_title = title.strip(': ')
+            cur_lines = []
+        else:
+            cur_lines.append(ln)
+    if cur_title or cur_lines:
+        sections.append((cur_title, cur_lines))
 
-        for line in body_lines:
-            section_parts.extend(_format_line_to_markdown(line))
+    # If no explicit sections found, just bulletize
+    if all(t is None for t, _ in sections):
+        return _format_block_as_list(lines)
 
-        if not section_parts:
-            section_parts = [para]
-
-        formatted_sections.append("\n".join(section_parts))
-
-    return "\n\n".join(formatted_sections) if formatted_sections else text
+    rendered = []
+    for title, block in sections:
+        if title:
+            rendered.append(f"### {title.strip()}")
+        # Detect slide-structured blocks under certain sections
+        if any(k in (title or "").lower() for k in ["improvement", "change", "remove"]):
+            rendered.append(_render_slide_block(block))
+        else:
+            rendered.append(_format_block_as_list(block))
+    # Final cleanup: collapse triple newlines
+    md = "\n\n".join([s.strip() for s in rendered if s and s.strip()])
+    md = re.sub(r"\n{3,}", "\n\n", md).strip()
+    return md
 
 # -----------------------------
 # Minimal single-shot UI with pre-upload + progress
@@ -497,17 +564,8 @@ if start:
         if not final_text:
             raise RuntimeError("Pitch Audit AI returned an empty response. Try again in a moment.")
 
-        # Restructure locally; fall back to raw text if the formatter returns placeholder copy
-        structured = _format_output(final_text)
-        cleaned_structured = (structured or "").strip()
-        placeholder_phrases = {
-            "please provide the text you would like me to format",
-            "please provide the text you want me to format",
-        }
-        use_structured = bool(cleaned_structured) and all(
-            phrase not in cleaned_structured.lower() for phrase in placeholder_phrases
-        )
-        final_output = cleaned_structured if use_structured else final_text
+        # Format the raw Dify output locally to match the structured style
+        final_output = format_dify_output(final_text)
 
         # clear the progress UI once complete
         prog_slot.empty()
