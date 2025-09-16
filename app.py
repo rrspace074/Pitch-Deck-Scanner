@@ -514,7 +514,8 @@ def format_dify_output(text: str) -> str:
     rendered = []
     for title, block in sections:
         if title:
-            rendered.append(f"### {title.strip()}")
+            # Render headings without markdown hashes, as bold text
+            rendered.append(f"**{title.strip()}**")
         # Detect slide-structured blocks under certain sections
         if any(k in (title or "").lower() for k in ["improvement", "change", "remove"]):
             rendered.append(_render_slide_block(block))
@@ -522,6 +523,13 @@ def format_dify_output(text: str) -> str:
             rendered.append(_format_block_as_list(block))
     # Final cleanup: collapse triple newlines
     md = "\n\n".join([s.strip() for s in rendered if s and s.strip()])
+    # Put demo call link on the next line after the sentence
+    md = re.sub(
+        r"(Scheduled a demo call with us for more insights:)\s*(\[[^\]]+\]\([^\)]+\)|https?://\S+|Demo Call)",
+        r"\1\n\2",
+        md,
+        flags=re.IGNORECASE,
+    )
     md = re.sub(r"\n{3,}", "\n\n", md).strip()
     return md
 
