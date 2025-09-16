@@ -6,13 +6,12 @@
 #   NEXT_PUBLIC_APP_ID    (optional)
 
 import os
-import json
 import base64
 import random
 import mimetypes
 import uuid
 import hashlib
-from typing import Generator, List, Optional
+from typing import List, Optional
 
 import requests
 import streamlit as st
@@ -224,58 +223,59 @@ def dify_upload_file(file_name: str, file_bytes: bytes, mime: Optional[str], use
     return upload_id
 
 
-def dify_stream_chat(query: str, files_payload: Optional[List[dict]], user: str) -> Generator[str, None, None]:
-    payload = {"inputs": {}, "query": query, "response_mode": "streaming", "user": user}
+def dify_chat(query: str, files_payload: Optional[List[dict]], user: str) -> str:
+    """Call Dify in blocking mode and return the assistant's answer as text."""
+    payload = {"inputs": {}, "query": query, "response_mode": "blocking", "user": user}
     if st.session_state.conversation_id:
         payload["conversation_id"] = st.session_state.conversation_id
     if files_payload:
         payload["files"] = files_payload
 
     url = f"{API_BASE}/chat-messages"
-    with requests.post(url, headers=_headers(json_mode=True), json=payload, stream=True, timeout=1200) as r:
-        if r.status_code >= 400:
-            try:
-                err = r.json()
-            except Exception:
-                err = r.text
-            raise RuntimeError(f"{r.status_code}: {err}")
-        final_buffer = []
-        for raw in r.iter_lines(decode_unicode=True):
-            if not raw or raw.startswith(":"):
-                continue
-            if not raw.startswith("data:"):
-                continue
-            data_str = raw[5:].strip()
-            if not data_str:
-                continue
-            try:
-                evt = json.loads(data_str)
-            except Exception:
-                continue
-            conv_id = evt.get("conversation_id")
-            if conv_id and not st.session_state.conversation_id:
-                st.session_state.conversation_id = conv_id
-            event_type = evt.get("event")
-            # Stream incremental tokens when available
-            if event_type in ("message", "agent_message", "tool_message", "message_delta"):
-                delta = (evt.get("answer") or evt.get("output_text") or evt.get("data") or "")
-                if isinstance(delta, dict):
-                    delta = delta.get("text") or delta.get("content") or ""
-                if delta:
-                    final_buffer.append(str(delta))
-                    yield str(delta)
-            elif event_type in ("message_end", "agent_message_end", "completed", "workflow_finished"):
-                # Some Dify apps send only the final text on *_end events; make sure we surface it.
-                tail = (evt.get("answer") or evt.get("output_text") or "")
-                if isinstance(tail, dict):
-                    tail = tail.get("text") or tail.get("content") or ""
-                if tail:
-                    final_buffer.append(str(tail))
-                    yield str(tail)
-                break
-            elif event_type == "error":
-                err_msg = evt.get("message") or evt.get("error") or "Model error"
-                raise RuntimeError(err_msg)
+    resp = requests.post(url, headers=_headers(json_mode=True), json=payload, timeout=1200)
+    if resp.status_code >= 400:
+        try:
+            err = resp.json()
+        except Exception:
+            err = resp.text
+        raise RuntimeError(f"{resp.status_code}: {err}")
+
+    try:
+        body = resp.json()
+    except Exception as exc:
+        raise RuntimeError(f"Invalid JSON from Dify: {resp.text}") from exc
+
+    conv_id = (
+        body.get("conversation_id")
+        or body.get("data", {}).get("conversation_id")
+        or body.get("data", {}).get("conversation", {}).get("id")
+    )
+    if conv_id:
+        st.session_state.conversation_id = conv_id
+
+    # Pull any textual answer from the response payload
+    candidates = [
+        body.get("answer"),
+        body.get("output_text"),
+        body.get("message"),
+        body.get("data"),
+    ]
+    text = ""
+    for candidate in candidates:
+        text = _collapse_text(candidate)
+        if text:
+            break
+
+    # Fallback: collapse the full body if needed
+    if not text:
+        text = _collapse_text(body)
+
+    text = (text or "").strip()
+    if not text:
+        raise RuntimeError(f"Pitch Audit AI returned an unexpected response payload: {body}")
+
+    st.session_state["_dify_last_raw"] = text
+    return text
 
 
 # -----------------------------
@@ -319,6 +319,65 @@ def _restructure_with_openai(text: str) -> Optional[str]:
         return None
     except Exception:
         return None
+
+
+# -----------------------------
+# Helpers to collapse nested Dify payloads into plaintext
+# -----------------------------
+
+
+def _collapse_text(value) -> str:
+    """Extract readable text from nested structures returned by Dify."""
+    if value is None:
+        return ""
+    if isinstance(value, (str, int, float)):
+        return str(value).strip()
+    if isinstance(value, list):
+        parts = [_collapse_text(item) for item in value]
+        return "\n".join(part for part in parts if part)
+    if isinstance(value, dict):
+        parts: List[str] = []
+        preferred_keys = (
+            "answer",
+            "output_text",
+            "text",
+            "content",
+            "message",
+            "value",
+            "result",
+            "display_text",
+        )
+        for key in preferred_keys:
+            if key in value:
+                part = _collapse_text(value[key])
+                if part:
+                    parts.append(part)
+
+        container_keys = (
+            "outputs",
+            "messages",
+            "items",
+            "segments",
+            "choices",
+            "values",
+            "children",
+            "data",
+        )
+        for key in container_keys:
+            if key in value:
+                part = _collapse_text(value[key])
+                if part:
+                    parts.append(part)
+
+        # As a last resort, look at any remaining nested values
+        if not parts:
+            for sub_value in value.values():
+                part = _collapse_text(sub_value)
+                if part:
+                    parts.append(part)
+
+        return "\n".join(part for part in parts if part)
+    return ""
 
 
 # -----------------------------
@@ -434,9 +493,6 @@ if start:
 
     RANDOM_QUERIES = [
         "Scan this pitch deck and give a crisp summary (company, problem, solution, traction, ask).",
-        "Extract key metrics, GTM, business model, competitors and risks from this deck.",
-        "Summarize the opportunity, product, moat, and top 5 red flags in this deck.",
-        "Create a bullet summary of team, roadmap, market size, business model and funding ask.",
     ]
     query = random.choice(RANDOM_QUERIES)
 
@@ -444,18 +500,10 @@ if start:
         # Visual progress bar while the model is generating; fills to 90% gradually and 100% at completion.
         prog_slot = st.empty()
         prog = prog_slot.progress(0)
+        prog.progress(10)
 
-        final_chunks: List[str] = []
-        pct = 0
-        for chunk in dify_stream_chat(query, files_payload or None, st.session_state.dify_user):
-            pct = min(90, pct + 2)
-            prog.progress(pct)
-            final_chunks.append(str(chunk))
+        final_text = dify_chat(query, files_payload or None, st.session_state.dify_user).strip()
         prog.progress(100)
-
-        final_text = "".join(final_chunks).strip()
-        if not final_text:
-            raise RuntimeError("Pitch Audit AI returned an empty response. Try again in a moment.")
 
         structured = _restructure_with_openai(final_text)
         cleaned_structured = (structured or "").strip()
