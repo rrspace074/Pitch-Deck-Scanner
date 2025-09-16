@@ -4,7 +4,8 @@
 #   NEXT_PUBLIC_API_URL   (default: https://api.dify.ai/v1)
 #   NEXT_PUBLIC_APP_KEY   (required)
 #   NEXT_PUBLIC_APP_ID    (optional)
-#   OPENAI_API_KEY        (required; used to minimally reformat Dify output)
+#   OPENAI_API_KEY        (optional; if set, used to reformat Dify output)
+#   DIFY_INPUTS_JSON      (optional; JSON dict merged into inputs for the app)
 
 import os
 import json
@@ -38,6 +39,7 @@ def _get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
 API_BASE = _get_secret("NEXT_PUBLIC_API_URL", "https://api.dify.ai/v1").rstrip("/")
 API_KEY = _get_secret("NEXT_PUBLIC_APP_KEY", "")
 APP_ID = _get_secret("NEXT_PUBLIC_APP_ID", "")
+OPENAI_KEY = _get_secret("OPENAI_API_KEY", "")
 
 # Stable per-session user id (Dify requires a user identifier)
 if "dify_user" not in st.session_state:
@@ -184,7 +186,22 @@ with st.sidebar:
 if not API_KEY:
     st.error("NEXT_PUBLIC_APP_KEY is required. Set it in your environment or .streamlit/secrets.toml.")
     st.stop()
-# No OpenAI dependency — all formatting is done locally
+def _build_inputs() -> dict:
+    """Build inputs for Dify app. Merge optional JSON from secrets/env and set fallbacks
+    for common variables seen in workflows (structured_output, website, llm)."""
+    base: dict = {}
+    raw = _get_secret("DIFY_INPUTS_JSON", "")
+    if raw:
+        try:
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                base.update(parsed)
+        except Exception:
+            pass
+    base.setdefault("structured_output", False)
+    base.setdefault("website", "")
+    base.setdefault("llm", "")
+    return base
 
 # -----------------------------
 # Dify HTTP helpers
@@ -230,7 +247,7 @@ def dify_upload_file(file_name: str, file_bytes: bytes, mime: Optional[str], use
 
 
 def dify_stream_chat(query: str, files_payload: Optional[List[dict]], user: str) -> Generator[str, None, None]:
-    payload = {"inputs": {}, "query": query, "response_mode": "streaming", "user": user}
+    payload = {"inputs": _build_inputs(), "query": query, "response_mode": "streaming", "user": user}
     if st.session_state.conversation_id:
         payload["conversation_id"] = st.session_state.conversation_id
     if files_payload:
@@ -287,7 +304,7 @@ def dify_blocking_chat(query: str, files_payload: Optional[List[dict]], user: st
     """Call Dify with response_mode=blocking and return the final answer text.
     Ensures we wait for long-running workflows and still capture the final output.
     """
-    payload = {"inputs": {}, "query": query, "response_mode": "blocking", "user": user}
+    payload = {"inputs": _build_inputs(), "query": query, "response_mode": "blocking", "user": user}
     if st.session_state.conversation_id:
         payload["conversation_id"] = st.session_state.conversation_id
     if files_payload:
@@ -333,7 +350,7 @@ def dify_blocking_chat(query: str, files_payload: Optional[List[dict]], user: st
     return str(ans)
 
 # -----------------------------
-# Local Dify-output formatter -> Markdown
+# Local Dify-output formatter -> Markdown (with optional OpenAI reformatter)
 # -----------------------------
 
 import re
@@ -442,6 +459,37 @@ def _format_block_as_list(block_lines: List[str]) -> str:
     return "\n".join(out)
 
 def format_dify_output(text: str) -> str:
+    # If OpenAI key present, try a light reformat via OpenAI first
+    if OPENAI_KEY:
+        try:
+            resp = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "temperature": 0,
+                    "max_tokens": min(2048, max(300, len(text) // 4)),
+                    "messages": [
+                        {"role": "system", "content": (
+                            "Restructure the user's text into clear Markdown with short headings matching sections like 'Strengths', 'Red Flags', 'Improvement Tips', 'Remove / Merge', 'Change', 'Consistency Check', 'The Action Plan', 'Data Points'. "
+                            "Preserve wording; only add headings and bullets. Return ONLY Markdown."
+                        )},
+                        {"role": "user", "content": text},
+                    ],
+                },
+                timeout=60,
+            )
+            if resp.status_code < 400:
+                j = resp.json()
+                content = ((j.get("choices") or [{}])[0].get("message") or {}).get("content")
+                if content and content.strip():
+                    text = content.strip()
+        except Exception:
+            pass
+
     lines = _clean_lines(text)
     # Split into sections
     sections = []  # (title, lines)
