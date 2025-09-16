@@ -474,8 +474,11 @@ def format_dify_output(text: str) -> str:
                     "max_tokens": min(2048, max(300, len(text) // 4)),
                     "messages": [
                         {"role": "system", "content": (
-                            "Restructure the user's text into clear Markdown with short headings matching sections like 'Strengths', 'Red Flags', 'Improvement Tips', 'Remove / Merge', 'Change', 'Consistency Check', 'The Action Plan', 'Data Points'. "
-                            "Preserve wording; only add headings and bullets. Return ONLY Markdown."
+                            "Return clean Markdown with: (1) section titles as bold lines (no # hashes), (2) bullet points using '- ' only, (3) numeric lists allowed, (4) keep wording, (5) no code blocks.\n"
+                            "Target sections include 'Strengths', 'Red Flags (High Priority Concerns)', 'Improvement Tips', 'Add', 'Remove / Merge', 'Change', 'Consistency Check', 'The Action Plan', 'Data Points (Can Include)', 'Schedule a Demo Call (this & link should be on the next line)'.\n"
+                            "Example style:\n"
+                            "**Improvement Tips**\n- **Slide Name**: Competition & Differentiation\n  - Why: Investors need to compare against peers.\n  - Bullets\n    - Top competitors...\n    - Your edge...\n\n"
+                            "Do not use heading hashes; use bold for titles only."
                         )},
                         {"role": "user", "content": text},
                     ],
@@ -490,6 +493,18 @@ def format_dify_output(text: str) -> str:
         except Exception:
             pass
 
+    # Pre-sanitize any heading hashes and odd '###-' bullet starts
+    def _strip_heading_hashes(t: str) -> str:
+        t = t.replace("\r\n", "\n").replace("\r", "\n")
+        cleaned = []
+        for ln in t.split("\n"):
+            ln = re.sub(r"^\s*#+\s*[-*]\s+", "- ", ln)  # ### - point -> - point
+            ln = re.sub(r"^\s*#+\s*(\d+\.)\s+", r"\1 ", ln)  # ### 1. -> 1.
+            ln = re.sub(r"^\s*#+\s*", "", ln)  # strip remaining leading #
+            cleaned.append(ln)
+        return "\n".join(cleaned)
+
+    text = _strip_heading_hashes(text)
     lines = _clean_lines(text)
     # Split into sections
     sections = []  # (title, lines)
@@ -515,7 +530,7 @@ def format_dify_output(text: str) -> str:
     for title, block in sections:
         if title:
             # Render headings without markdown hashes, as bold text
-            rendered.append(f"###{title.strip()}")
+            rendered.append(f"**{title.strip()}**")
         # Detect slide-structured blocks under certain sections
         if any(k in (title or "").lower() for k in ["improvement", "change", "remove"]):
             rendered.append(_render_slide_block(block))
