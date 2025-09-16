@@ -282,6 +282,56 @@ def dify_stream_chat(query: str, files_payload: Optional[List[dict]], user: str)
                 err_msg = evt.get("message") or evt.get("error") or "Model error"
                 raise RuntimeError(err_msg)
 
+
+def dify_blocking_chat(query: str, files_payload: Optional[List[dict]], user: str, timeout_sec: int = 1200) -> str:
+    """Call Dify with response_mode=blocking and return the final answer text.
+    Ensures we wait for long-running workflows and still capture the final output.
+    """
+    payload = {"inputs": {}, "query": query, "response_mode": "blocking", "user": user}
+    if st.session_state.conversation_id:
+        payload["conversation_id"] = st.session_state.conversation_id
+    if files_payload:
+        payload["files"] = files_payload
+
+    url = f"{API_BASE}/chat-messages"
+    r = requests.post(url, headers=_headers(json_mode=True), json=payload, timeout=timeout_sec)
+    if r.status_code >= 400:
+        try:
+            err = r.json()
+        except Exception:
+            err = r.text
+        raise RuntimeError(f"{r.status_code}: {err}")
+    j = r.json()
+    # Capture conversation id if present
+    conv_id = j.get("conversation_id") or j.get("result", {}).get("conversation_id")
+    if conv_id and not st.session_state.conversation_id:
+        st.session_state.conversation_id = conv_id
+
+    # Dify variants: answer, output_text, result.answer, data.text
+    def pick(obj: dict) -> Optional[str]:
+        if not isinstance(obj, dict):
+            return None
+        for key in ("answer", "output_text", "text", "content"):
+            val = obj.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+        return None
+
+    # Try several shapes
+    ans = pick(j) or pick(j.get("data", {})) or pick(j.get("result", {}))
+    if not ans:
+        # Some apps return a list of messages under data
+        data = j.get("data") or j.get("result") or {}
+        msgs = data.get("messages") if isinstance(data, dict) else None
+        if isinstance(msgs, list) and msgs:
+            for m in reversed(msgs):
+                ans = pick(m) or pick(m.get("data", {}))
+                if ans:
+                    break
+    if not ans:
+        raise RuntimeError("Dify returned no answer in blocking mode.")
+    return str(ans)
+
 # -----------------------------
 # Local Dify-output formatter -> Markdown
 # -----------------------------
@@ -558,11 +608,13 @@ if start:
             pct = min(90, pct + 2)
             prog.progress(pct)
             final_chunks.append(str(chunk))
-        prog.progress(100)
+        prog.progress(95)
 
         final_text = "".join(final_chunks).strip()
         if not final_text:
-            raise RuntimeError("Pitch Audit AI returned an empty response. Try again in a moment.")
+            # Fallback: wait for final result with blocking call
+            final_text = dify_blocking_chat(query, files_payload or None, st.session_state.dify_user)
+        prog.progress(100)
 
         # Format the raw Dify output locally to match the structured style
         final_output = format_dify_output(final_text)
