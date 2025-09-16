@@ -515,7 +515,7 @@ def format_dify_output(text: str) -> str:
     for title, block in sections:
         if title:
             # Render headings without markdown hashes, as bold text
-            rendered.append(f"**{title.strip()}**")
+            rendered.append(f"###{title.strip()}")
         # Detect slide-structured blocks under certain sections
         if any(k in (title or "").lower() for k in ["improvement", "change", "remove"]):
             rendered.append(_render_slide_block(block))
