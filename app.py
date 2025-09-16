@@ -1,1808 +1,690 @@
-# app.py
-# Tokenomics Audit AI — all-in-one deployable Streamlit app
-# Includes: TDeFi styling, sheet template download/upload, metrics, grounded AI, PDF export
+# app.py — Streamlit x Dify "Pitch Audit AI" (single-shot app)
+# Run:  streamlit run app.py
+# Env vars expected (or via .streamlit/secrets.toml):
+#   NEXT_PUBLIC_API_URL   (default: https://api.dify.ai/v1)
+#   NEXT_PUBLIC_APP_KEY   (required)
+#   NEXT_PUBLIC_APP_ID    (optional)
+#   OPENAI_API_KEY        (optional; if set, used to reformat Dify output)
+#   DIFY_INPUTS_JSON      (optional; JSON dict merged into inputs for the app)
 
-import streamlit as st
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from fpdf import FPDF
-import tempfile
 import os
-import re
-import io
 import json
 import base64
-from openai import OpenAI
+import random
+import mimetypes
+import uuid
+import hashlib
+from typing import Generator, List, Optional
 
-from typing import Optional
+import requests
+import streamlit as st
+
+# For OpenAI post-processing (use requests; no extra deps)
+import time
 
 # -----------------------------
-# Helper: Safe OpenAI API key retrieval
+# Config & helpers
 # -----------------------------
-def get_openai_api_key():
-    env_key = os.environ.get("OPENAI_API_KEY")
-    if env_key:
-        return env_key
+
+def _get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
+    # Prefer Streamlit secrets first, then environment
     try:
-        if hasattr(st, "secrets") and hasattr(st.secrets, "__getitem__"):
-            openai_section = st.secrets.get("openai") if hasattr(st.secrets, "get") else None
-            if openai_section and isinstance(openai_section, dict):
-                return openai_section.get("api_key")
+        val = st.secrets.get(name)  # type: ignore[attr-defined]
+        if val:
+            return str(val)
     except Exception:
         pass
-    return None
+    return os.getenv(name, default)
+
+API_BASE = _get_secret("NEXT_PUBLIC_API_URL", "https://api.dify.ai/v1").rstrip("/")
+API_KEY = _get_secret("NEXT_PUBLIC_APP_KEY", "")
+APP_ID = _get_secret("NEXT_PUBLIC_APP_ID", "")
+OPENAI_KEY = _get_secret("OPENAI_API_KEY", "")
+
+# Stable per-session user id (Dify requires a user identifier)
+if "dify_user" not in st.session_state:
+    st.session_state.dify_user = f"user-{uuid.uuid4()}"
+
+# Track Dify conversation id
+if "conversation_id" not in st.session_state:
+    st.session_state.conversation_id = None
+
+# Track uploads across reruns to avoid re-uploading same file
+st.session_state.setdefault("uploaded_fps", {})   # fp -> {id, type, name}
+st.session_state.setdefault("uploaded_payload", [])
+st.session_state.setdefault("uploader_key", 0)
 
 # -----------------------------
-# Streamlit page config + CSS
+# Page config + styles
 # -----------------------------
-st.set_page_config(
-    page_title="Tokenomics Audit AI",
-    layout="wide",
-    initial_sidebar_state="collapsed"
-)
 
-st.markdown("""
+st.set_page_config(page_title="Pitch Audit AI • Dify", page_icon="🤖", layout="wide")
+
+# --- Dark theme with gold accents (inspired by reference) ---
+DARK_THEME_CSS = """
 <style>
-    .company-logo {
-        position: relative;
-        background: transparent;
-        padding: 0;
-        border: none;
-        box-shadow: none;
-        max-width: 220px;
-        max-height: 80px;
-        margin: 10px 0 0 0;
-        display: block;
-    }
-    .company-logo img { max-width: 100%; max-height: 36px; height: auto; object-fit: contain; display: block; }
+  :root{
+    --gold: #F5C542;
+    --gold-2: #D9A521;
+    --bg: #0c0f14;
+    --panel: #11151d;
+    --text: #EAEFF5;
+    --muted: #B7BEC9;
+    --muted-2: #96A0AF;
+  }
+  /* App background */
+  div[data-testid="stAppViewContainer"]{
+    background:
+      radial-gradient(80% 120% at 10% 10%, rgba(245,197,66,0.09) 0%, rgba(0,0,0,0) 55%),
+      radial-gradient(60% 100% at 90% 10%, rgba(245,197,66,0.07) 0%, rgba(0,0,0,0) 60%),
+      repeating-linear-gradient(135deg, rgba(245,197,66,0.06) 0 2px, rgba(0,0,0,0) 2px 22px),
+      var(--bg);
+    color: var(--text);
+  }
+  /* Remove Streamlit default white top header */
+  header[data-testid="stHeader"],
+  div[data-testid="stHeader"],
+  div[data-testid="stToolbar"]{
+    display: none !important;
+  }
+  .block-container{ padding-top: 0 !important; }
+  section[data-testid="stSidebar"]{ background:#0b0e12; border-right:1px solid rgba(255,255,255,.06); }
 
-    .main-header {
-        background: linear-gradient(90deg, #ffc107 0%, #fd7e14 100%);
-        padding: 0.6rem 1rem;
-        border-radius: 10px;
-        margin-bottom: 1.2rem;
-        color: white;
-        box-shadow: 0 4px 15px rgba(255, 193, 7, 0.3);
-        display: block;
-    }
-    .main-header-inner { display: flex; align-items: center; justify-content: flex-end; gap: 0.6rem; width: 100%; }
-    .main-title { display: none; }
-    .powered-wrap { display: none; }
+  /* Hero */
+  .hero{ margin: 24px 0 22px 0; padding: 64px 24px 48px; text-align: center; position: relative; background:
+      radial-gradient(120% 160% at 50% 0%, rgba(245,197,66,0.08) 0%, rgba(20,22,30,0.0) 60%);
+      border-radius: 20px;
+  }
+  .hero h1{ font-size:56px; line-height:1.1; margin:0 0 12px 0; color:var(--text); font-weight:800; }
+  .hero h1 .powered { font-size:18px; font-weight:700; color: var(--muted); margin-left:16px; vertical-align: middle; }
+  .hero h1 .powered img{ height:56px; width:auto; border-radius:10px; vertical-align:middle; margin-left:8px; }
+  .hero h2{ font-size:28px; font-weight:700; margin:0 0 16px 0; opacity:1; display:inline-block; padding:12px 20px; border-radius:14px; background:linear-gradient(180deg, var(--gold) 0%, var(--gold-2) 100%); color:#14161e; box-shadow:0 8px 24px rgba(245,197,66,0.25); }
+  .hero p{ color:var(--muted); margin:0 0 26px 0; font-size:16px; }
+  .hero .pill{ display:inline-block; padding:14px 22px; border-radius:14px; background:linear-gradient(180deg, var(--gold) 0%, var(--gold-2) 100%); color:#14161e; font-weight:800; box-shadow:0 8px 24px rgba(245,197,66,0.25); margin:10px 0 18px 0; }
+  .primary-cta{ background:linear-gradient(180deg,var(--gold) 0%, var(--gold-2) 100%); color:#14161e; font-weight:800; padding:12px 22px; border-radius:12px; border:1px solid rgba(255,255,255,.08); display:inline-block; box-shadow:0 8px 24px rgba(245,197,66,0.25); text-decoration:none; }
+  .primary-cta:hover{ filter:brightness(1.03); }
+  .small-note{ color:var(--muted-2); font-size:14px; margin-top:10px; }
 
-    .tdefi-powered {
-        text-align: center;
-        background: linear-gradient(135deg, #1a1a1a 0%, #2d2d2d 100%);
-        color: white;
-        font-size: 1.1rem;
-        font-weight: bold;
-        margin: 2rem 0 1rem 0;
-        padding: 1.2rem;
-        border-radius: 12px;
-        border: 3px solid #ffc107;
-        box-shadow: 0 8px 25px rgba(255, 193, 7, 0.2);
-        position: relative;
-        overflow: hidden;
-    }
-    .tdefi-powered::before {
-        content: '';
-        position: absolute;
-        top: 0; left: -100%;
-        width: 100%; height: 100%;
-        background: linear-gradient(90deg, transparent, rgba(255, 193, 7, 0.1), transparent);
-        animation: shine 3s infinite;
-    }
-    @keyframes shine { 0% { left: -100%; } 100% { left: 100%; } }
+  /* Buttons */
+  .stButton > button[kind="primary"]{
+    background: linear-gradient(180deg, var(--gold) 0%, var(--gold-2) 100%) !important;
+    color: #14161e !important; border: 0 !important; border-radius: 12px !important; font-weight: 800 !important;
+    box-shadow: 0 8px 24px rgba(245,197,66,0.25) !important; padding: 0.6rem 1.5rem !important; max-width: 280px; margin: 0 auto; display:block;
+  }
+  .stButton > button[kind="secondary"]{
+    background:#161a22 !important; color: var(--text) !important; border:1px solid rgba(255,255,255,.08) !important; border-radius:12px !important;
+  }
 
-    .tdefi-logo-text {
-        display: inline-block;
-        background: linear-gradient(90deg, #ffc107 0%, #fd7e14 100%);
-        -webkit-background-clip: text;
-        -webkit-text-fill-color: transparent;
-        background-clip: text;
-        font-size: 1.4rem;
-        font-weight: 900;
-        text-shadow: 2px 2px 4px rgba(0,0,0,0.3);
-    }
+  /* Uploader */
+  div[data-testid="stFileUploaderDropzone"],
+  div[data-testid="stFileUploaderDropzone"] > div,
+  div[data-testid="stFileUploader"] section {
+    background:linear-gradient(180deg, var(--gold) 0%, var(--gold-2) 100%) !important;
+    color:#14161e !important;
+  }
+  div[data-testid="stFileUploaderDropzone"] *{ color:#14161e !important; }Limit 15MB
+  div[data-testid="stFileUploaderDropzone"] p:nth-of-type(2){ color:transparent !important; position:relative; }
+  div[data-testid="stFileUploaderDropzone"] p:nth-of-type(2)::after{ content: "Limit 15MB per file • PDF, PPT, PPTX, DOC, DOCX, TXT"; position:absolute; left:0; right:0; top:0; color:#14161e !important; }
+  /* Fallback targeting for versions where the helper is the last <p> */
+  div[data-testid="stFileUploaderDropzone"] p:last-of-type{ color:transparent !important; position:relative; }
+  div[data-testid="stFileUploaderDropzone"] p:last-of-type::after{ content: "Limit 15MB per file • PDF, PPT, PPTX, DOC, DOCX, TXT"; position:absolute; left:0; right:0; top:0; color:#14161e !important; }
+  /* Browse button inside uploader */
+  div[data-testid="stFileUploader"] button{ background:#14161e !important; color:var(--text) !important; border:1px solid rgba(20,22,30,.45) !important; border-radius:10px !important; }
+  div[data-testid="stFileUploader"] small { display: none !important; }
 
-    .stButton > button {
-        background: linear-gradient(90deg, #FF6B35 0%, #FFD700 100%);
-        color: white;
-        border: none;
-        border-radius: 25px;
-        padding: 0.5rem 2rem;
-        font-weight: bold;
-        box-shadow: 0 4px 15px rgba(255, 107, 53, 0.3);
-        transition: all 0.3s ease;
-    }
-    .stButton > button:hover { transform: translateY(-2px); box-shadow: 0 6px 20px rgba(255, 107, 53, 0.4); }
-
-    .metric-card {
-        background: linear-gradient(135deg, #1a1a1a 0%, #2d2d2d 100%);
-        padding: 1rem;
-        border-radius: 10px;
-        border-left: 4px solid #FF6B35;
-        color: white;
-        margin: 0.5rem 0;
-    }
-    .success-box {
-        background: linear-gradient(135deg, #28a745 0%, #20c997 100%);
-        color: white;
-        padding: 0.6rem 0.8rem;
-        border-radius: 10px;
-        text-align: center;
-        font-weight: 700;
-        font-size: 0.95rem;
-    }
-    .warning-box {
-        background: linear-gradient(135deg, #ffc107 0%, #fd7e14 100%);
-        color: white;
-        padding: 1rem;
-        border-radius: 10px;
-        text-align: center;
-        font-weight: bold;
-    }
-
-    /* Analysis sections styling for consistent alignment */
-    .analysis-section { background: #111; border: 1px solid #2a2a2a; border-radius: 10px; padding: 1rem; margin: 1rem 0; }
-    .analysis-title { margin: 0 0 0.25rem 0; font-weight: 800; font-size: 1.1rem; color: #ffd166; }
-    .analysis-subtitle { margin: 0 0 0.5rem 0; color: #333333; font-style: italic; }
-    .analysis-stat { margin: 0.25rem 0; font-weight: 700; color: #000000; }
-    .analysis-price { margin: 0.35rem 0; color: #000000; }
-    .analysis-price b { color: #ffb703; }
-    .analysis-body { margin: 0.25rem 0; color: #000000; }
-    .analysis-suggestions-title { margin: 0.5rem 0 0.25rem 0; font-weight: 700; color: #ffffff; }
-    .analysis-suggestions { margin: 0.25rem 0 0.5rem 1rem; }
-    .analysis-suggestions li { margin: 0.15rem 0; }
+  /* Result + info */
+  .result-box { border: 1px solid rgba(255,255,255,.08); border-radius: 12px; padding: 16px; background: #0f131b; color: var(--text); }
+  .tiny { text-align:center; font-size:.85rem; color: var(--muted-2); margin-top: 10px; }
+  h1, h2, h3, h4, h5, h6, label, p, .stMarkdown { color: var(--text); }
+  .spacer24 { height:24px; }
+  .spacer32 { height:32px; }
 </style>
-""", unsafe_allow_html=True)
+"""
 
-# -----------------------------
-# Logo helper
-# -----------------------------
-def _get_logo_data_uri():
-    candidates = [
-        "your_logo.png", "your_logo.jpeg", "your_logo.jpg",
-        "logo.png", "logo.jpg", "logo.jpeg",
-    ]
-    for filename in candidates:
-        try:
-            if os.path.exists(filename):
-                mime = "image/png" if filename.lower().endswith(".png") else "image/jpeg"
-                with open(filename, "rb") as f:
-                    b64 = base64.b64encode(f.read()).decode("ascii")
-                return f"data:{mime};base64,{b64}"
-        except Exception:
-            continue
-    return None
+st.markdown(DARK_THEME_CSS, unsafe_allow_html=True)
 
-_logo_uri = _get_logo_data_uri()
+# Load local logo (your_logo.jpeg) as base64 so we can embed in HTML
+
+def _load_logo_b64(path: str = "your_logo.jpeg") -> Optional[str]:
+    try:
+        with open(path, "rb") as f:
+            return base64.b64encode(f.read()).decode("ascii")
+    except Exception:
+        return None
+
+logo_b64 = _load_logo_b64()
+logo_img_tag = f'<img style="height:56px;width:auto;border-radius:10px;vertical-align:middle;margin-left:10px;" src="data:image/jpeg;base64,{logo_b64}">' if logo_b64 else ""
+
+# Hero section to match dark/gold theme
 st.markdown(
     f"""
-<div class="main-header">
-  <div class="main-header-inner">
-    {f'<img src="{_logo_uri}" alt="Company Logo" style="height: 31px;" />' if _logo_uri else ''}
-  </div>
-</div>
-""",
+    <div class=\"hero\">
+        <h1>Pitch Audit AI <span class=\"powered\">powered by {logo_img_tag if logo_img_tag else 'AI'}</span></h1>
+        <h2>Create investor‑ready decks</h2>
+    </div>
+    """,
     unsafe_allow_html=True,
 )
 
 # -----------------------------
-# Template Builder (XLSX with sample rows) + CSV
+# Sidebar — only "Clear conversation"
 # -----------------------------
-def build_template_excel() -> Optional[bytes]:
-    """
-    Build an XLSX template if an Excel writer engine is available.
-    Falls back to returning None when neither 'openpyxl' nor 'xlsxwriter' is installed.
-    """
-    # Prepare dataframes
-    tokenomics_cols = [
-        "Pool Name", "Allocation %", "Category", "TGE Unlock %",
-        "Cliff (months)", "Vesting (months)", "Sellable at TGE (Yes/No)", "Notes",
-    ]
-    sample_rows = [
-        ["Private 1", 8, "VC", 5, 6, 12, "No", "5% at TGE, 6M cliff, 12M vest"],
-        ["Private 2", 6, "VC", 10, 3, 9, "No", "10% TGE, 3M cliff, 9M vest"],
-        ["Public Sale", 6, "Community", 20, 0, 6, "Yes", "20% TGE, rest linear 6M"],
-        ["Team & Advisors", 16, "Team", 0, 12, 18, "No", "Cliff 12M, vest 18M"],
-        ["Treasury", 10, "Other", 20, 0, 48, "No", "20% at TGE, vest 48M"],
-        ["Foundation", 5, "Other", 10, 0, 12, "No", "10% TGE, vest 12M"],
-        ["Liquidity", 10, "Liquidity", 30, 0, 24, "Yes", "30% at TGE, vest 24M"],
-        ["Community Airdrop", 4, "Community", 50, 3, 1, "Yes", "50% TGE, remaining at month 4"],
-        ["Community Engagement", 30, "Community", 0, 3, 60, "No", "3M cliff, vest 60M"],
-        ["Community Marketing", 5, "Community", 10, 3, 60, "Yes", "10% TGE, 3M cliff, vest 60M"],
-    ]
-    df_inputs = pd.DataFrame(sample_rows, columns=tokenomics_cols)
+with st.sidebar:
+    st.write("")
+    if st.button("Clear conversation", type="secondary", use_container_width=True):
+        st.session_state.conversation_id = None
+        st.session_state.uploaded_fps = {}
+        st.session_state.uploaded_payload = []
+        st.session_state.pop("last_output", None)
+        st.session_state["uploader_key"] += 1  # reset the file_uploader selection
+        st.rerun()
 
-    project_cols = [
-        "Project Name", "Total Supply", "TGE Price (USD)", "Liquidity Fund (USD)",
-        "Project Category", "Current User Base", "User Growth %",
-        "Monthly Incentive Spend (USD)", "Annual Revenue (USD)",
-    ]
-    df_proj = pd.DataFrame([[
-        "MyProject", 1_000_000_000, 0.02, 500_000,
-        "Gaming", 10_000, 10.0, 50_000, 1_000_000,
-    ]], columns=project_cols)
+    # Info line under the button
+    st.markdown("<div style='display:flex;align-items:center;gap:8px;color:#B7BEC9;font-size:0.9rem;'>ℹ️ <span>Reload if it doesn't respond in 60 sec.</span></div>", unsafe_allow_html=True)
 
-    # Detect an available engine
-    engine = None
-    try:
-        import openpyxl  # noqa: F401
-        engine = "openpyxl"
-    except Exception:
-        try:
-            import xlsxwriter  # noqa: F401
-            engine = "xlsxwriter"
-        except Exception:
-            engine = None
-
-    if engine is None:
-        return None
-
-    buf = io.BytesIO()
-    with pd.ExcelWriter(buf, engine=engine) as writer:
-        df_inputs.to_excel(writer, index=False, sheet_name="Tokenomics Inputs")
-        df_proj.to_excel(writer, index=False, sheet_name="Project Info")
-    buf.seek(0)
-    return buf.read()
-
-# Helper to build CSV template DataFrame (always works)
-def build_template_csv_df() -> pd.DataFrame:
-    tokenomics_cols = [
-        "Pool Name", "Allocation %", "Category", "TGE Unlock %",
-        "Cliff (months)", "Vesting (months)", "Sellable at TGE (Yes/No)", "Notes",
-    ]
-    sample_rows = [
-        ["Private 1", 8, "VC", 5, 6, 12, "No", "5% at TGE, 6M cliff, 12M vest"],
-        ["Private 2", 6, "VC", 10, 3, 9, "No", "10% TGE, 3M cliff, 9M vest"],
-        ["Public Sale", 6, "Community", 20, 0, 6, "Yes", "20% TGE, rest linear 6M"],
-        ["Team & Advisors", 16, "Team", 0, 12, 18, "No", "Cliff 12M, vest 18M"],
-        ["Treasury", 10, "Other", 20, 0, 48, "No", "20% at TGE, vest 48M"],
-        ["Foundation", 5, "Other", 10, 0, 12, "No", "10% TGE, vest 12M"],
-        ["Liquidity", 10, "Liquidity", 30, 0, 24, "Yes", "30% TGE, vest 24M"],
-        ["Community Airdrop", 4, "Community", 50, 3, 1, "Yes", "50% TGE, remaining at month 4"],
-        ["Community Engagement", 30, "Community", 0, 3, 60, "No", "3M cliff, vest 60M"],
-        ["Community Marketing", 5, "Community", 10, 3, 60, "Yes", "10% TGE, 3M cliff, vest 60M"],
-    ]
-    return pd.DataFrame(sample_rows, columns=tokenomics_cols)
-
-st.subheader("📥 Sheet-Based Inputs (optional)")
-c1, c2 = st.columns([2, 3])
-with c1:
-    st.caption("Download a ready-made template, fill it, then upload below.")
-    xl_bytes = build_template_excel()
-    csv_df = build_template_csv_df()
-
-    if xl_bytes is not None:
-        st.download_button(
-            "⬇️ Download Excel Template",
-            data=xl_bytes,
-            file_name="tokenomics_template.xlsx",
-            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-        )
-    else:
-        st.warning("Excel engines not found (install 'openpyxl' or 'xlsxwriter'). Download the CSV template instead.")
-
-    st.download_button(
-        "⬇️ Download CSV Template",
-        data=csv_df.to_csv(index=False).encode("utf-8"),
-        file_name="tokenomics_template.csv",
-        mime="text/csv",
-    )
-
-with c2:
-    uploaded = st.file_uploader("Upload your filled sheet (XLSX/CSV)", type=["xlsx", "xls", "csv"])
-    use_project_info_from_sheet = st.checkbox(
-        "Override Project Inputs from 'Project Info' sheet (if present)", value=True
-    )
-
-sheet_mode = False
-sheet_allocations, sheet_tags, sheet_vesting = None, None, None
-
-# -----------------------------
-# Default Project Inputs (UI)
-# -----------------------------
-col1, col2, col3 = st.columns(3)
-with col1:
-    project_name = st.text_input("Project Name", value="MyProject")
-    total_supply_tokens = st.number_input("Total Token Supply", min_value=1, value=1_000_000_000)
-    tge_price = st.number_input("Token Price at TGE (USD)", min_value=0.00001, value=0.02, step=0.01, format="%.5f")
-with col2:
-    liquidity_fund = st.number_input("Liquidity Fund (USD)", min_value=0.0, value=500000.0, step=10000.0)
-    project_type = st.selectbox("Project Category", ["Gaming", "DeFi", "NFT", "Infrastructure"], index=0)
-    user_base = st.number_input("Current User Base", min_value=0, value=10000)
-with col3:
-    user_growth_rate = st.number_input("Monthly User Growth Rate (%)", min_value=0.0, value=10.0) / 100
-    monthly_burn = st.number_input("Monthly Incentive Spend (USD)", min_value=0.0, value=50000.0, step=1000.0)
-    revenue = st.number_input("Annual Revenue (USD)", min_value=0.0, value=1000000.0, step=10000.0)
-
-# -----------------------------
-# Upload parsing -> dicts
-# -----------------------------
-if uploaded:
-    try:
-        if uploaded.name.lower().endswith(".csv"):
-            df_inputs = pd.read_csv(uploaded)
-            df_proj = None
-        else:
-            try:
-                df_inputs = pd.read_excel(uploaded, sheet_name="Tokenomics Inputs")
-                try:
-                    df_proj = pd.read_excel(uploaded, sheet_name="Project Info")
-                except Exception:
-                    df_proj = None
-            except ImportError as ie:
-                st.error("Reading .xlsx requires an Excel engine. Please `pip install openpyxl` (recommended) or upload a CSV using our template.")
-                st.stop()
-
-        df_inputs.columns = [str(c).strip() for c in df_inputs.columns]
-        required_cols = {
-            "Pool Name", "Allocation %", "Category", "TGE Unlock %",
-            "Cliff (months)", "Vesting (months)", "Sellable at TGE (Yes/No)"
-        }
-        if not required_cols.issubset(set(df_inputs.columns)):
-            st.error(f"Uploaded sheet is missing required columns:\n{sorted(list(required_cols - set(df_inputs.columns)))}")
-            st.stop()
-
-        def _to_float(x, default=0.0):
-            try:
-                return float(x)
-            except Exception:
-                return default
-
-        def _to_int(x, default=0):
-            try:
-                return int(float(x))
-            except Exception:
-                return default
-
-        sheet_allocations = {}
-        sheet_tags = {}
-        sheet_vesting = {}
-        for _, row in df_inputs.iterrows():
-            pool = str(row["Pool Name"]).strip()
-            if not pool:
-                continue
-            alloc = _to_float(row["Allocation %"])
-            tge = _to_float(row["TGE Unlock %"])
-            cliff = _to_int(row["Cliff (months)"])
-            vest = _to_int(row["Vesting (months)"])
-            sellable_str = str(row["Sellable at TGE (Yes/No)"]).strip().lower()
-            sellable = sellable_str in {"yes", "y", "true", "1"}
-
-            sheet_allocations[pool] = alloc
-            sheet_tags[pool] = str(row["Category"]).strip() if "Category" in row else "Other"
-            sheet_vesting[pool] = {"cliff": cliff, "vesting": vest, "tge": tge, "sellable": sellable}
-
-        total_from_sheet = sum(sheet_allocations.values())
-        st.info(f"📊 Sheet parsed. Total allocation = **{total_from_sheet:.2f}%**.")
-        if abs(total_from_sheet - 100.0) > 1e-6:
-            st.warning("Allocation must total 100%. Please fix your sheet and re-upload.")
-            st.stop()
-
-        if use_project_info_from_sheet and df_proj is not None and len(df_proj) > 0:
-            proj = df_proj.iloc[0].to_dict()
-            project_name = str(proj.get("Project Name", project_name))
-            total_supply_tokens = int(_to_float(proj.get("Total Supply", total_supply_tokens)))
-            tge_price = _to_float(proj.get("TGE Price (USD)", tge_price))
-            liquidity_fund = _to_float(proj.get("Liquidity Fund (USD)", liquidity_fund))
-            project_type = str(proj.get("Project Category", project_type))
-            user_base = int(_to_float(proj.get("Current User Base", user_base)))
-            user_growth_rate = _to_float(proj.get("User Growth %", user_growth_rate * 100.0)) / 100.0
-            monthly_burn = _to_float(proj.get("Monthly Incentive Spend (USD)", monthly_burn))
-            revenue = _to_float(proj.get("Annual Revenue (USD)", revenue))
-            st.success("✅ Project Info overridden from sheet.")
-        sheet_mode = True
-
-    except Exception as e:
-        st.error(f"Could not parse uploaded file: {e}")
-        st.stop()
-
-# -----------------------------
-# Step 1: Token Allocation & Vesting
-# -----------------------------
-st.header("📊 Step 1: Token Allocation & Vesting Schedule")
-
-if not sheet_mode:
-    st.markdown("Enter pool details in the table below:")
-    pool_names = st.text_area("Pool Names (comma-separated)", value="Private Sale, Public Sale, Team, Ecosystem, Advisors, Listing, Airdrop, Staking", height=80)
-    pools_list = [p.strip() for p in pool_names.split(",") if p.strip()]
-    if len(pools_list) == 0:
-        st.stop()
-
-    # Manual table inputs
-    col1m, col2m, col3m, col4m, col5m, col6m, col7m = st.columns(7)
-    with col1m: st.markdown("**Pool Name**")
-    with col2m: st.markdown("**Allocation %**")
-    with col3m: st.markdown("**Category**")
-    with col4m: st.markdown("**TGE Unlock %**")
-    with col5m: st.markdown("**Cliff (months)**")
-    with col6m: st.markdown("**Vesting (months)**")
-    with col7m: st.markdown("**Sellable at TGE**")
-
-    allocations, tags, vesting_schedule = {}, {}, {}
-    total_alloc = 0.0
-
-    for i, pool in enumerate(pools_list):
-        c1r, c2r, c3r, c4r, c5r, c6r, c7r = st.columns(7)
-        with c1r: st.markdown(f"**{pool}**")
-        with c2r:
-            allocations[pool] = st.number_input("", 0.0, 100.0, 0.0, step=1.0, key=f"alloc_{i}")
-            total_alloc += allocations[pool]
-        with c3r:
-            tags[pool] = st.selectbox("", ["VC", "Community", "Team", "Liquidity", "Advisor", "Other"], key=f"tag_{i}")
-        with c4r:
-            tge = st.number_input("", 0.0, 100.0, 0.0, step=1.0, key=f"tge_{i}")
-        with c5r:
-            cliff = st.number_input("", 0, 48, 0, key=f"cliff_{i}")
-        with c6r:
-            vesting = st.number_input("", 0, 72, 12, key=f"vesting_{i}")
-        with c7r:
-            sellable_choice = st.selectbox("", ["Yes", "No"], key=f"sellable_{i}")
-            sellable = (sellable_choice == "Yes")
-        vesting_schedule[pool] = {"cliff": cliff, "vesting": vesting, "tge": tge, "sellable": sellable}
-
-else:
-    # Sheet-based inputs
-    pools_list = list(sheet_allocations.keys())
-    allocations = sheet_allocations
-    tags = sheet_tags
-    vesting_schedule = sheet_vesting
-    total_alloc = sum(allocations.values())
-
-    st.success("✅ Using inputs from uploaded sheet.")
-    st.dataframe(pd.DataFrame([
-        {
-            "Pool": p,
-            "Allocation %": allocations[p],
-            "Category": tags.get(p, ""),
-            "TGE % (of pool)": vesting_schedule[p]["tge"],
-            "Cliff (m)": vesting_schedule[p]["cliff"],
-            "Vesting (m)": vesting_schedule[p]["vesting"],
-            "Sellable at TGE": "Yes" if vesting_schedule[p]["sellable"] else "No",
-        } for p in pools_list
-    ]))
-
-# Validate total allocation
-if total_alloc != 100:
-    st.markdown(f"""
-    <div class="warning-box">
-        ⚠️ Allocation must total 100%. Current: {total_alloc:.2f}%
-    </div>
-    """, unsafe_allow_html=True)
+# Safety check for keys (required)
+if not API_KEY:
+    st.error("NEXT_PUBLIC_APP_KEY is required. Set it in your environment or .streamlit/secrets.toml.")
     st.stop()
-else:
-    st.markdown(f"""
-    <div class="success-box">
-        ✅ Total allocation: {total_alloc:.0f}%
-    </div>
-    """, unsafe_allow_html=True)
-
-# -----------------------------
-# Build vesting schedule dataframe
-# -----------------------------
-months = list(range(72))
-df = pd.DataFrame({"Month": months})
-df["Monthly Release %"] = 0.0
-df["Cumulative %"] = 0.0
-
-for pool in pools_list:
-    tge_percent = allocations[pool] * vesting_schedule[pool]["tge"] / 100.0
-    cliff = int(vesting_schedule[pool]["cliff"])
-    vest = int(vesting_schedule[pool]["vesting"])
-    monthly_percent = (allocations[pool] - tge_percent) / vest if vest > 0 else 0.0
-
-    release = [0.0] * 72
-    # TGE (M0)
-    release[0] += tge_percent
-    start_m = cliff + 1
-    end_m = cliff + vest
-    if vest > 0:
-        for m in range(start_m, min(end_m, 71) + 1):
-            release[m] += monthly_percent
-
-    df[pool] = release
-    df["Monthly Release %"] += df[pool]
-
-df["Monthly Release Tokens"] = df["Monthly Release %"] * total_supply_tokens / 100.0
-df["Cumulative Tokens"] = df["Monthly Release Tokens"].cumsum()
-df["Cumulative %"] = (df["Cumulative Tokens"] / total_supply_tokens) * 100.0
-
-st.markdown("""
-<div class="success-box">
-    ✅ Vesting schedule processed successfully.
-</div>
-""", unsafe_allow_html=True)
-
-# -----------------------------
-# Metrics helpers
-# -----------------------------
-def inflation_guard(df: pd.DataFrame) -> list:
-    inflation = []
-    if "Cumulative Tokens" not in df.columns or len(df) == 0:
-        return inflation
-    cum = df["Cumulative Tokens"].values
-    n = len(cum)
-    for y in range(1, 7):
-        if y == 1:
-            start_idx = (y - 1) * 13  # 0
-        else:
-            start_idx = (y - 1) * 12
-        if start_idx >= n:
-            break
-        end_idx = y * 12
-        if end_idx >= n:
-            end_idx = n - 1
-        start_val = float(cum[start_idx])
-        end_val = float(cum[end_idx])
-        rate = ((end_val - start_val) / start_val) * 100.0 if start_val > 0 else 0.0
-        inflation.append(round(rate, 2))
-    return inflation
-
-def calculate_monthly_supply_shock(df: pd.DataFrame) -> pd.Series:
-    prev_circ = df["Cumulative Tokens"].shift(1).fillna(0.0)
-    monthly_tokens = df["Monthly Release Tokens"]
-    supply_shock = monthly_tokens.divide(prev_circ.replace(0, pd.NA)).fillna(0) * 100.0
-    return supply_shock.round(2)
-
-def shock_stopper(df: pd.DataFrame) -> dict:
-    ss = calculate_monthly_supply_shock(df)
-    ss = ss.iloc[1:] if len(ss) > 1 else ss  # exclude M0
-    out = {
-        "0–5%": int((ss <= 5).sum()),
-        "5–10%": int(((ss > 5) & (ss <= 10)).sum()),
-        "10–15%": int(((ss > 10) & (ss <= 15)).sum()),
-        "15%+": int((ss > 15).sum()),
-    }
-    out[">10% months"] = out["10–15%"] + out["15%+"]
-    out[">12% months"] = int((ss > 12).sum())
-    out[">15% months"] = int((ss > 15).sum())
-    out["% >10%"] = round(100 * out[">10% months"] / max(len(ss), 1), 2)
-    return out
-
-def governance_hhi(allocations):
-    shares_decimal = [v / 100 for v in allocations.values()]
-    hhi = sum([s ** 2 for s in shares_decimal])
-    return round(hhi, 3)
-
-def liquidity_shield_denominator(total_supply, tge_price, allocations, vesting, sellable_override=None):
-    # If sellable_override provided as set of pool names, only include those;
-    # otherwise include pools with sellable=True in vesting.
-    sellable_pct = 0.0
-    for p in allocations:
-        if sellable_override is None:
-            if vesting.get(p, {}).get("sellable"):
-                sellable_pct += allocations[p] * (vesting[p]["tge"] / 100.0)
-        else:
-            if p in sellable_override:
-                sellable_pct += allocations[p] * (vesting[p]["tge"] / 100.0)
-    tokens_sellable = total_supply * (sellable_pct / 100.0)
-    market_cap_at_tge = tokens_sellable * tge_price
-    return sellable_pct, int(tokens_sellable), float(market_cap_at_tge)
-
-def lockup_ratio(vesting, allocations, mode="supply"):
-    eligible = [p for p in vesting if vesting[p].get("cliff", 0) >= 12]
-    if mode == "pools":
-        total = len(vesting) or 1
-        return round(len(eligible) / total, 2)
-    else:
-        locked_percent = sum(allocations.get(p, 0.0) for p in eligible)
-        return round(locked_percent / 100.0, 2)
-
-def vc_dominance(allocations, tags):
-    return round(sum([allocations[p] for p in allocations if tags.get(p) == "VC"]) / 100, 2)
-
-def community_index(allocations, tags):
-    return round(sum([allocations[p] for p in allocations if tags.get(p) == "Community"]) / 100, 2)
-
-def emission_taper(df):
-    first_12 = df.loc[0:11, "Monthly Release Tokens"].sum()
-    last_12 = df["Monthly Release Tokens"].tail(12).sum()
-    return round(first_12 / last_12 if last_12 > 0 else 0.0, 2)
-
-def summarize_sim(sim_list):
-    arr = np.array(sim_list, dtype=float)
-    if arr.size == 0:
-        return {"min": 0, "p25": 0, "median": 0, "p75": 0, "p90": 0, "max": 0}
-    return {
-        "min": float(np.min(arr)),
-        "p25": float(np.percentile(arr, 25)),
-        "median": float(np.median(arr)),
-        "p75": float(np.percentile(arr, 75)),
-        "p90": float(np.percentile(arr, 90)),
-        "max": float(np.max(arr)),
-    }
-
-def monte_carlo_simulation(df, user_base, growth, months, category, total_supply, tge_price):
-    # Simple survivability simulation with clamped moves and small noise
-    if category == "Gaming":       arpu_monthly = (76 / 12) * 0.03
-    elif category == "DeFi":       arpu_monthly = (3300 / 12) * 0.03
-    elif category == "NFT":        arpu_monthly = (59 / 12) * 0.03
-    else:                          arpu_monthly = (50 / 12) * 0.03
-
-    rng = np.random.default_rng(seed=42)
-    simulations = []
-    for _ in range(100):
-        price = float(tge_price)
-        for m in range(min(months, len(df))):
-            users = user_base * ((1 + growth) ** m)
-            buy_pressure = users * arpu_monthly
-            tokens_released = (df.loc[m, "Monthly Release %"] / 100.0) * total_supply
-            sell_pressure = max(tokens_released * price, 1e-9)
-            net_pressure = buy_pressure - sell_pressure
-            price_change_factor = (net_pressure / sell_pressure)
-            sensitivity = 0.10
-            raw_move = price_change_factor * sensitivity
-            clamped = float(np.clip(raw_move, -0.5, 2.0))  # −50% to +200% per month
-            noise = rng.normal(0, 0.02)
-            price *= max(0.0001, 1.0 + clamped + noise)
-        simulations.append(price)
-    return simulations
-
-def game_theory_audit(hhi, shield, inflation):
-    score = 0
-    if hhi < 0.15: score += 1
-    if shield >= 1.0: score += 1
-    if len(inflation) > 0 and inflation[0] <= 300: score += 1
-    if len(inflation) > 1 and inflation[1] <= 100: score += 1
-    if len(inflation) > 2 and inflation[2] <= 50: score += 1
-    label = "Excellent" if score >= 4 else "Moderate" if score == 3 else "Needs Improvement"
-    return label, score
-
-# -----------------------------
-# Structured audit prompt helper
-# -----------------------------
-def build_structured_prompt(metrics: dict) -> str:
-    import json as _json
-    return f"""
-ROLE
-You are a senior tokenomics analyst. You audit token designs for investors and founders.
-Be concise, structured, and institutional. Avoid fluff.
-Do NOT invent numbers — only use values present inside <metrics>.
-
-INPUT
-<metrics>
-{_json.dumps(metrics, indent=2)}
-</metrics>
-
-GLOBAL RULES
-- Use ONLY metrics that exist in <metrics>. If a metric is missing, omit its section.
-- Use the EXACT section titles below (important for rendering).
-- For each section: include a one-line “Purpose — …” (definition) → “STAT:” line → “Price Impact — …” line → 2–3 “Suggestions:” bullets.
-- Keep bullets short and action-oriented. Tie numbers → interpretation → price effect → fix.
-- Values: keep units and significant figures; don’t round away meaning.
-- Do not repeat definitions across metrics; keep each definition to one clear sentence.
-
-OUTPUT STRUCTURE
-
-1) Red Flags (first section)
-- List the top 3–5 risks as single-line bullets in the format:
-  - <Cause with metric + value> → <Effect on float/liquidity/governance> → <Impact on price/investor trust>.
-- Choose the most material risks across all provided metrics.
-
-2) Section by Section Analysis (use only metrics that exist in <metrics>)
-
-YoY Inflation
-Purpose — Define “YoY Inflation” in one sentence (change in circulating supply year over year).
-STAT: Y1: <y1%>, Y2: <y2%>, Y3: <y3%>, Y4: <y4%>, Y5: <y5%>, Y6: <y6%>.
-Price Impact — <One clear line on expected price/holder behavior given these %s>.
-Suggestions:
-- <Actionable fix #1 tied to mechanics/comms/sinks>
-- <Actionable fix #2>
-- <Actionable fix #3>
-
-Supply Shock Bins
-Purpose — Define “monthly supply shock” (monthly release as % of prior circulating) and why bins matter.
-STAT: 0–5%: <n0_5> | 5–10%: <n5_10> | 10–15%: <n10_15> | 15%+: <n15p>; >10% months: <share>% — <diffuse/mixed/concentrated> release profile.
-Price Impact — <One line on clustering near >10% months and expected drawdowns/liquidity needs>.
-Suggestions:
-- <Smooth or gate large unlocks via milestones/liquidity programs>
-- <Stagger cliffs; convert to linear with caps>
-- <Pre-announce market-making/liquidity buffers>
-
-Governance HHI
-Purpose — Define HHI as concentration index of token ownership/allocation (0–1, lower = more dispersed).
-STAT: HHI: <hhi>.
-Price Impact — <One line linking concentration to governance capture, sell pressure coordination, or signaling>.
-Suggestions:
-- <Broaden distribution, e.g., via community programs/lock-to-vote>
-- <Cap single-pool allocations/introduce decay>
-- <Strengthen quorum/anti-whale safeguards>
-
-Liquidity Shield Ratio
-Purpose — Define as Liquidity Fund / Sellable Mcap at TGE (higher = better defense).
-STAT: Liquidity Shield: <ratio>x; Sellable at TGE: <sellable_pct>% (<sellable_tokens> tokens); Sellable Mcap: $<sellable_mcap>.
-Price Impact — <One line on near-TGE volatility absorption and tail-risk>.
-Suggestions:
-- <Increase shield via larger liquidity fund/partner MM>
-- <Reduce sellable at TGE/limit initial float>
-- <Pair with fee rebates/LP incentives during volatile windows>
-
-Lockup Ratio
-Purpose — Define as share of supply/pools with cliff ≥12 months (stickier float).
-STAT: Lockup (Supply): <lock_supply_pct>% | Lockup (Pools): <lock_pools_pct>% (eligibility: cliff ≥12m).
-Price Impact — <One line on early-months float tightness vs delayed overhang>.
-Suggestions:
-- <Raise cliff on strategic pools / align with product milestones>
-- <Introduce progressive vesting vs large cliffs>
-- <Offer lock-to-earn programs for communities/teams>
-
-VC Dominance
-Purpose — Define as % of supply tagged “VC” (higher = potential sell/coordination risk).
-STAT: VC Dominance: <vc_pct>%.
-Price Impact — <One line on perceived overhang and investor signaling>.
-Suggestions:
-- <Redistribute via follow-on community rounds with lockups>
-- <Hard commit to extended VC lock/earn-out>
-- <Enhance disclosures on VC lock/participation>
-
-Community Control Index
-Purpose — Define as % of supply tagged “Community” (higher = alignment, usage flywheel).
-STAT: Community Control: <community_pct>%.
-Price Impact — <One line on adoption/retention vs speculation balance>.
-Suggestions:
-- <Route emissions to active users/revenue-linked rewards>
-- <Delegate grants via on-chain KPIs>
-- <Lock-to-use or usage-mining frameworks>
-
-Emission Taper
-Purpose — Define as ratio of tokens released in first 12m vs last 12m (front- vs back-loaded).
-STAT: Emission Taper: <taper_ratio>x.
-Price Impact — <One line on early sell pressure vs long-run sustainability>.
-Suggestions:
-- <Flatten early curve; move to milestone-gated linear>
-- <Cap monthly max unlocks>
-- <Tie emissions to real demand (users/revenue)>
-
-Monte Carlo Survivability
-Purpose — Define as distribution of simulated end-prices given buy/sell pressure model.
-STAT: USD — min: <min>, p25: <p25>, median: <median>, p75: <p75>, p90: <p90>, max: <max>.
-Price Impact — <One line on downside tails or upside skew and what drives it>.
-Suggestions:
-- <Reduce release rate in adverse months>
-- <Boost demand levers (ARPU, active users) before major unlocks>
-- <Add sinks/fees/redemptions>
-
-Game Theory Score
-Purpose — Define as composite score of structure (HHI, shield, inflation, etc.).
-STAT: Score: <score>/5 — <label>.
-Price Impact — <One line on overall investability/readiness for listings>.
-Suggestions:
-- <Target the weakest sub-metric from above>
-- <Publish a clear unlock/liquidity and governance policy>
-- <Stage reforms before major catalysts>
-
-3) Final Summary (1–2 lines)
-- One institutional line capturing float at TGE (<sellable_pct>% / $<sellable_mcap>), the standout strength, and the main risk.
-- If FDV or other fields are NOT present in <metrics>, do not mention them.
-
-STYLE GUIDANCE
-- Bold only the section headers (exact titles above).
-- Keep “Purpose — …”, “STAT: …”, “Price Impact — …”, then short “Suggestions:” bullets.
-- Never add sections not listed. Never fabricate numbers. Keep it tight and decision-useful.
-""".strip()
-
-# -----------------------------
-# Generate button (centered)
-# -----------------------------
-col_left, col_center, col_right = st.columns([4, 2, 4])
-with col_center:
-    generate = st.button("🚀 Generate Audit Report")
-
-# -----------------------------
-# Run audit
-# -----------------------------
-if generate:
-    # Core metrics
-    inflation = inflation_guard(df)
-    df['Supply Shock %'] = calculate_monthly_supply_shock(df)
-    shock = shock_stopper(df)
-    hhi = governance_hhi(allocations)
-
-    # Liquidity Shield — by default use 'sellable' flags from inputs
-    sellable_pct, sellable_tokens, sellable_mc = liquidity_shield_denominator(
-        total_supply_tokens, tge_price, allocations, vesting_schedule, sellable_override=None
-    )
-    shield = round(liquidity_fund / sellable_mc, 2) if sellable_mc > 0 else 0.0
-
-    lock_supply = lockup_ratio(vesting_schedule, allocations, mode="supply")
-    lock_pools = lockup_ratio(vesting_schedule, allocations, mode="pools")
-    vc = vc_dominance(allocations, tags)
-    community = community_index(allocations, tags)
-    taper = emission_taper(df)
-    monte = monte_carlo_simulation(df, user_base, user_growth_rate, 24, project_type, total_supply_tokens, tge_price)
-    game_label, game_score = game_theory_audit(hhi, shield, inflation)
-
-    # Score card
-    st.markdown(f"""
-    <div class="metric-card">
-        <h3>🎯 Game Theory Audit Score: {game_score}/5</h3>
-        <p style="font-size: 1.1rem; color: #FF6B35; margin: 0;">{game_label}</p>
-    </div>
-    """, unsafe_allow_html=True)
-
-    # Year 1 table
-    try:
-        year1 = df.loc[0:12, ["Month", "Monthly Release Tokens", "Cumulative Tokens", "Cumulative %"]].copy()
-        year1["Month"] = year1["Month"].apply(lambda m: f"M{int(m)}")
-        year1["Monthly Release Tokens"] = year1["Monthly Release Tokens"].apply(lambda x: f"{x:,.0f}")
-        year1["Cumulative Tokens"] = year1["Cumulative Tokens"].apply(lambda x: f"{x:,.0f}")
-        year1["Cumulative %"] = year1["Cumulative %"].apply(lambda x: f"{x:.2f}%")
-        st.markdown("### Year 1 Cumulative Token Release (M0–M12)")
-        st.table(year1)
-    except Exception as e:
-        st.markdown(f"<div class='warning-box'>Could not render Year 1 table: {e}</div>", unsafe_allow_html=True)
-
-    # Build figures (do not display here; will place under matching sections)
-    # TDeFi theme colors
-    tdefi_yellow = "#ffb703"  # warm yellow
-    tdefi_orange = "#fd7e14"
-
-    fig1, ax1 = plt.subplots(figsize=(6, 4))
-    years = list(range(1, len(inflation) + 1))
-    bars = ax1.bar(years, inflation, color=tdefi_yellow, alpha=0.95, edgecolor="#333333")
-    ax1.set_title("Inflation Guard", color="#000000")
-    ax1.set_xlabel("Year", color="#000000"); ax1.set_ylabel("%", color="#000000")
-    ax1.grid(True, axis='y', alpha=0.25)
-    # Set y-limits with headroom so labels don't collide with top
-    max_val = max(inflation) if len(inflation) else 0
-    ax1.set_ylim(0, max_val * 1.18 + (5 if max_val < 50 else 0))
-    for rect, val in zip(bars, inflation):
-        ax1.text(rect.get_x() + rect.get_width()/2.0, rect.get_height() * 1.02,
-                 f"{val:.0f}%", ha='center', va='bottom', fontsize=9, color="#000000")
-    ax1.tick_params(colors="#000000")
-
-    fig2, ax2 = plt.subplots(figsize=(6, 4))
-    ordered_bins = ["0–5%", "5–10%", "10–15%", "15%+"]
-    ax2.bar(ordered_bins, [shock[b] for b in ordered_bins], color=tdefi_orange, alpha=0.95, edgecolor="#333333")
-    ax2.set_title("Shock Stopper", color="#000000")
-    ax2.grid(True, axis='y', alpha=0.25)
-    ax2.tick_params(colors="#000000")
-    ax2.set_ylim(0, max([shock[b] for b in ordered_bins]) * 1.18 + 1)
-
-    fig3, ax3 = plt.subplots(figsize=(6, 4))
-    if len(set(np.round(monte, 6))) > 1:
-        ax3.hist(monte, bins=min(20, len(set(np.round(monte, 6)))), color=tdefi_yellow, edgecolor="#333333")
-        ax3.set_title("Monte Carlo Survivability", color="#000000")
-    else:
-        ax3.bar(["Simulated"], [monte[0]], color=tdefi_yellow, edgecolor="#333333")
-        ax3.set_title("Simulation Output", color="#000000")
-    ax3.grid(True, axis='y', alpha=0.25)
-    ax3.tick_params(colors="#000000")
-
-    # Optional: supply shock early months figure (kept for future use, not auto-rendered)
-    fig_shock = None
-    try:
-        shocks = df.loc[1:5, ['Month', 'Supply Shock %']].copy()
-        fig_shock, ax_shock = plt.subplots(figsize=(10, 4))
-        x_labels = [f"M{int(m)}" for m in shocks['Month']]
-        values = shocks['Supply Shock %'].tolist()
-        ax_shock.bar(x_labels, values)
-        ax_shock.set_title("Major Supply Shocks (Early Months)")
-        ax_shock.set_ylabel("%")
-        for i, v in enumerate(values):
-            ax_shock.text(i, v * 1.01, f"{v:.2f}%", ha='center', va='bottom', fontsize=9)
-    except Exception:
-        fig_shock = None
-
-    # -----------------------------
-    # Grounded AI analysis
-    # -----------------------------
-    api_key = get_openai_api_key()
-    if not api_key:
-        st.markdown("""
-        <div class="warning-box">
-            ❌ Missing OpenAI API key. Set OPENAI_API_KEY env var or add st.secrets['openai']['api_key'].
-        </div>
-        """, unsafe_allow_html=True)
-        st.stop()
-
-    client = OpenAI(api_key=api_key)
-
-    metrics = {
-        "project_name": project_name,
-        "total_supply": int(total_supply_tokens),
-        "tge_price_usd": float(tge_price),
-        "liquidity_fund_usd": float(liquidity_fund),
-        "sellable_at_tge_pct": float(round(sellable_pct, 4)),
-        "sellable_at_tge_tokens": int(sellable_tokens),
-        "sellable_mcap_at_tge_usd": float(round(sellable_mc, 2)),
-        "yoy_inflation_pct": inflation,
-        "shock_bins": shock,
-        "governance_hhi": float(hhi),
-        "liquidity_shield_ratio": float(shield),
-        "lockup_ratio_supply_pct": float(round(lock_supply * 100, 2)),
-        "lockup_ratio_pools_pct": float(round(lock_pools * 100, 2)),
-        "vc_dominance_pct": float(round(vc * 100, 2)),
-        "community_index_pct": float(round(community * 100, 2)),
-        "emission_taper_ratio": float(taper),
-        "monte_carlo_summary_price_usd": summarize_sim(monte),
-        "game_theory_score": int(game_score),
-        "game_theory_label": game_label,
-    }
-
-    with st.spinner("🤖 AI is analyzing your tokenomics..."):
-        analysis_prompt = build_structured_prompt(metrics)
-
-        response = client.chat.completions.create(
-            model="gpt-4o",
-            messages=[
-                {"role": "system", "content": "You are a senior tokenomics audit analyst."},
-                {"role": "user", "content": analysis_prompt}
-            ],
-            temperature=0.3
-        )
-        summary = response.choices[0].message.content
-
-    # Parse and render AI analysis into aligned sections with graphs placed contextually
-    st.markdown("""
-    <div class="metric-card">
-        <h3>🤖 AI Tokenomics Analysis</h3>
-    </div>
-    """, unsafe_allow_html=True)
-
-    SECTION_TITLES = [
-        "Red Flags",
-        "Section by Section Analysis",
-        "YoY Inflation",
-        "Supply Shock Bins",
-        "Supply Shock",
-        "Supply Shock bins",
-        "Governance HHI",
-        "Liquidity Shield Ratio",
-        "Lockup Ratio",
-        "VC Dominance",
-        "Community Control Index",
-        "Emission Taper",
-        "Monte Carlo Survivability",
-        "Game Theory Score",
-    ]
-
-    def _strip_leading_bullets(s: str) -> str:
-        return re.sub(r'^[\s\-\*•·]+', '', s or '').strip()
-
-    def _split_title_subtitle(s: str, section_names: list[str]):
-        raw = s.strip()
-        # Normalize: drop leading numbering/emojis/bullets like "1) ", "🚩 ", "- "
-        raw = re.sub(r'^(?:\d+\)|\d+\.|[\-\*•·]+|🚩|🔴|🟠|🟡|🔵|🔒|💼|👥|📉|🎲|🧠)\s*', '', raw)
-        for name in section_names:
-            if raw.lower().startswith(name.lower()):
-                rest = raw[len(name):].lstrip()
-                rest = re.sub(r'^(—|–|-|:)\s*', '', rest)
-                rest = re.sub(r'^\s{2,}', '', rest)
-                return (name, rest)
-        return None
-
-    def parse_ai_summary_sections(text: str):
-        lines = (text or '').replace('\r\n', '\n').replace('\r', '\n').split('\n')
-        # Find header indices
-        headers = []  # (idx, title, subtitle)
-        for i, raw in enumerate(lines):
-            nob = _strip_leading_bullets(raw)
-            split = _split_title_subtitle(nob, SECTION_TITLES)
-            if split:
-                headers.append((i, split[0], split[1]))
-        # If none detected, return one generic section
-        if not headers:
-            return [{
-                'title': 'Summary', 'subtitle': '', 'stat': '', 'price': '', 'explainer': [], 'suggestions': []
-            }]
-        sections = []
-        for h_idx, (idx, title, subtitle) in enumerate(headers):
-            end = headers[h_idx + 1][0] if h_idx + 1 < len(headers) else len(lines)
-            chunk = [l.strip() for l in lines[idx+1:end] if l.strip()]
-            purpose = ''
-            stat = ''
-            price_line = ''
-            tail_bullets = []
-            expl_paras = []
-            for ln in chunk:
-                nob = _strip_leading_bullets(ln)
-                # Purpose
-                if re.match(r'^purpose\b', nob, flags=re.I):
-                    purpose = re.sub(r'^purpose\s*[—:-]?\s*', '', nob, flags=re.I)
-                    continue
-                # STAT (accept both 'STAT' and 'Impact' labels)
-                if nob.upper().startswith('STAT') or nob.upper().startswith('IMPACT'):
-                    stat = re.sub(r"^(STAT|Impact)\s*(Impact)?\s*[:\-—]?\s*", '', nob, flags=re.I)
-                    continue
-                # Price/Investor (or Price Impact) — treat as a single bullet line
-                if re.match(r'^(price\s*impact|price/investor)\b', nob, flags=re.I):
-                    price_line = re.sub(r'^(price\s*impact|price/investor)\s*[:\-—]?\s*', '', nob, flags=re.I).strip()
-                    continue
-                # Ignore explicit 'Suggestions:' label lines per new prompt
-                if re.match(r'^suggestions?\s*:\s*$', nob, flags=re.I):
-                    continue
-                # Bullet → suggestion
-                if re.match(r'^([\-\*•·]+)\s+.+$', ln):
-                    s = _strip_leading_bullets(ln)
-                    tail_bullets.append(s)
-                    continue
-                # Otherwise explainer paragraph
-                # Ignore any 'Here ... means -' lines to keep the layout minimal
-                if re.match(r'^here\b', nob, flags=re.I):
-                    continue
-                expl_paras.append(nob)
-            sections.append({
-                'title': title,
-                'subtitle': subtitle,
-                'purpose': purpose,
-                'stat': stat,
-                'price': price_line,
-                'tail_bullets': tail_bullets,
-                'explainer': expl_paras,
-            })
-        return sections
-
-    sections = parse_ai_summary_sections(summary)
-
-    # Map figures to sections
-    fig_map = {
-        'yoy inflation': fig1,
-        'supply shock': fig2,
-        'shock stopper': fig2,
-        'monte carlo survivability': fig3,
-        'monte carlo': fig3,
-    }
-
-    for sec in sections:
-        title = sec['title']
-        subtitle = sec.get('subtitle') or ''
-        purpose = sec.get('purpose') or ''
-        stat = sec.get('stat') or ''
-        price_text = sec.get('price') or ''
-        tail_bullets = sec.get('tail_bullets') or []
-        expl = sec.get('explainer') or []
-
-        st.markdown(f"<div class='analysis-section'>", unsafe_allow_html=True)
-        # Distinct style for Red Flags
-        key_title = title.lower().strip()
-        if key_title == 'red flags':
-            st.markdown(f"<div class='analysis-title' style='color:#ff4d4f;'>🚩 {title}</div>", unsafe_allow_html=True)
-        elif key_title == 'section by section analysis':
-            st.markdown(f"<div class='analysis-title' style='font-size:1.3rem;'>{title}</div>", unsafe_allow_html=True)
-        else:
-            st.markdown(f"<div class='analysis-title'>{title}</div>", unsafe_allow_html=True)
-        # Purpose (prefer explicit Purpose; fallback to subtitle)
-        if purpose:
-            st.markdown(f"<div class='analysis-body'><b>Purpose -</b> {purpose}</div>", unsafe_allow_html=True)
-        elif subtitle:
-            st.markdown(f"<div class='analysis-body'>{subtitle}</div>", unsafe_allow_html=True)
-        if stat:
-            st.markdown(f"<div class='analysis-stat'>{stat}</div>", unsafe_allow_html=True)
-
-        # Place figure immediately after STAT
-        key = title.lower().strip()
-        if 'supply shock' in key:
-            key = 'supply shock'
-        if 'yoy' in key or 'year-over-year' in key:
-            key = 'yoy inflation'
-        if 'monte carlo' in key:
-            key = 'monte carlo survivability'
-        fig_to_show = fig_map.get(key)
-        if stat and fig_to_show is not None and title.lower().strip() != 'red flags':
-            st.pyplot(fig_to_show, clear_figure=False)
-
-        # Price Impact bullet then remaining bullets
-        if price_text:
-            st.markdown(f"- Price Impact — {price_text}", unsafe_allow_html=True)
-        if tail_bullets:
-            st.markdown("<b>Suggestions -</b>", unsafe_allow_html=True)
-        for item in tail_bullets:
-            st.markdown(f"- {item}")
-
-        st.markdown("</div>", unsafe_allow_html=True)
-        # Divider between metrics
-        st.markdown("---")
-
-    # -----------------------------
-    # PDF Report
-    # -----------------------------
-    def strip_md(text: str) -> str:
-        """Remove basic markdown like **bold** and inline code."""
-        t = text or ""
-        t = re.sub(r"\*\*(.+?)\*\*", r"\1", t)
-        t = re.sub(r"`([^`]*)`", r"\1", t)
-        t = t.replace("**", "").replace("*", "") 
-        return t.strip()
-
-    def _find_logo_path():
-        """Try common filenames for a logo to place in the PDF header."""
-        for fn in [
-            "your_logo.jpeg",
-        ]:
-            if os.path.exists(fn):
-                return fn
-        return None
-
-    # Check if we can render unicode (emojis) by using a local TTF font if present.
-    UNICODE_FONT = None
-    for ttf in ["DejaVuSans.ttf", "NotoSans-Regular.ttf"]:
-        if os.path.exists(ttf):
-            UNICODE_FONT = ttf
-            break
-    # Optional bold unicode font (for true bold headings if available)
-    UNICODE_FONT_BOLD = None
-    for ttf in ["DejaVuSans-Bold.ttf", "NotoSans-Bold.ttf"]:
-        if os.path.exists(ttf):
-            UNICODE_FONT_BOLD = ttf
-            break
-
-    def dash_safe(text: str) -> str:
-        """Replace Unicode dashes with ASCII hyphen-minus for core fonts."""
-        return (text or "").replace("—", "-").replace("–", "-")
-
-    def title_with_emoji(title: str) -> str:
-        """Return the plain title (no emojis) to match the desired format."""
-        return title.strip()
-
-    class PDF(FPDF):
-        def __init__(self, logo_path=None):
-            super().__init__()
-            self.logo_path = logo_path
-
-        def header(self):
-            # Only show the logo at the top-right, scaled to 60%
-            if self.logo_path and os.path.exists(self.logo_path):
-                try:
-                    logo_w = 13  # ~60% of previous 22mm
-                    x_pos = self.w - self.r_margin - logo_w
-                    self.image(self.logo_path, x=x_pos, y=8, w=logo_w)
-                except Exception:
-                    pass
-            # First page: centered title
-            if self.page_no() == 1:
-                try:
-                    if UNICODE_FONT:
-                        self.add_font("DejaVu", "", UNICODE_FONT, uni=True)
-                        if UNICODE_FONT_BOLD:
-                            self.add_font("DejaVu", "B", UNICODE_FONT_BOLD, uni=True)
-                        self.set_font("DejaVu", "", 16)
-                    else:
-                        self.set_font("Arial", "B", 16)
-                except Exception:
-                    self.set_font("Arial", "B", 16)
-                self.set_y(10)
-                self.cell(0, 10, sanitize_text("Tokenomics Audit Report"), ln=True, align="C")
-                # Optional small project name under title
-                try:
-                    if UNICODE_FONT:
-                        self.set_font("DejaVu", "", 11)
-                    else:
-                        self.set_font("Arial", "I", 11)
-                except Exception:
-                    self.set_font("Arial", "I", 11)
-                self.cell(0, 7, sanitize_text(project_name), ln=True, align="C")
-                self.ln(2)
-            else:
-                # Small spacer to separate header from body on subsequent pages
-                self.ln(8)
-
-        def footer(self):
-            self.set_y(-15)
-            self.set_font("Arial", "I", 8)
-            self.cell(0, 10, "Report by TDeFi", 0, 0, "C")
-
-    # Sanitize helper aware of unicode capability
-    def sanitize_text(text):
-        t = (text or "").strip()
-        if UNICODE_FONT:
-            return t  # keep unicode (emojis)
-        # Replace unicode dashes with ASCII hyphen before latin-1 encoding to avoid dropping ranges like 0–5%
-        t = dash_safe(t)
-        # ensure latin-1 safe for default Arial
-        return t.encode("latin-1", "ignore").decode("latin-1")
-
-    def normalize_ai_summary(text: str) -> str:
-        """
-        Insert smart breaks so 'Price Impact —' (or legacy 'Price/Investor —')
-        starts on its own line, and tidy excessive spaces.
-        """
-        if not text:
-            return ""
-        t = text.replace("\r\n", "\n").replace("\r", "\n")
-        # Break after STAT sentences when 'Price Impact —' or 'Price/Investor —' follows on the same line
-        t = re.sub(r"\.\s+Price\s*Impact\s+—\s+", ".\nPrice Impact — ", t, flags=re.I)
-        t = re.sub(r"\.\s+Price/Investor\s+—\s+", ".\nPrice/Investor — ", t, flags=re.I)
-        # Collapse long spaces
-        t = re.sub(r"[ \t]+", " ", t)
-        return t.strip()
-
-    def render_structured_summary(pdf: FPDF, summary_text: str, effective_page_width: float, base_font_size: int = 11, section_images: Optional[dict] = None):
-        """
-        Renders the AI summary preserving structure:
-        - Headings like 'YoY Inflation — ...' become bold titles (with emojis if available) + italic subtitle.
-        - Lines beginning with 'Price Impact —' (or 'Price/Investor —' legacy) are emphasized.
-        - Lines starting with '- ' are bullets (kept).
-        - Remaining lines are paragraphs.
-        """
-        BULLET = "•" if UNICODE_FONT else "\xb7"  # prefer solid bullet when unicode font available
-        SECTION_SPACING = 2
-        line_h = 7
-        BULLET_CELL_W = 3.5
-        INDENT = 6
-
-        def _insert_section_image_for(title: str):
-            if not section_images or not title:
-                return False
-            key = title.lower()
-            if 'supply shock' in key:
-                key_norm = 'supply shock'
-            elif 'yoy' in key or 'inflation' in key:
-                key_norm = 'yoy inflation'
-            elif 'monte carlo' in key:
-                key_norm = 'monte carlo'
-            else:
-                key_norm = key
-            path = None
-            if key_norm in section_images:
-                path = section_images[key_norm]
-            else:
-                for k, v in section_images.items():
-                    if k in key_norm:
-                        path = v; break
-            if path and os.path.exists(path):
-                pdf.ln(1)
-                fig_width = effective_page_width
-                pdf.image(path, x=pdf.l_margin, w=fig_width)
-                pdf.ln(2)
-                return True
-            return False
-
-        def _strip_leading_bullets(s: str) -> str:
-            # Remove any leading bullet markers and surrounding spaces: -, *, •, ·
-            return re.sub(r'^[\s\-\*•·]+', '', s or '').strip()
-
-        def _split_title_subtitle(s: str, section_names: list[str]) -> tuple[str, str] | None:
-            """
-            Try to split a line into (title, subtitle) when it starts with a known section name.
-            Accept separators: em/en dash, hyphen, colon, or 2+ spaces.
-            Returns (title, subtitle) or None if not a section header.
-            """
-            raw = s.strip()
-            # If raw begins with a known title, try multiple separators
-            for name in section_names:
-                if raw.lower().startswith(name.lower()):
-                    rest = raw[len(name):].lstrip()
-                    if not rest:
-                        return (name, "")
-                    # Strip common separators
-                    rest = re.sub(r'^(—|–|-|:)\s*', '', rest)
-                    # If still begins with multiple spaces, treat as separator
-                    rest = re.sub(r'^\s{2,}', '', rest)
-                    return (name, rest)
-            # If it contains a dash separator like "Title — subtitle"
-            m = re.match(r'^(.+?)\s*[—–-]\s*(.+)$', raw)
-            if m and any(raw.lower().startswith(n.lower()) for n in section_names):
-                return (m.group(1).strip(), m.group(2).strip())
-            return None
-
-        # Optionally switch to a Unicode font so emojis render
-        if UNICODE_FONT:
-            try:
-                pdf.add_font("DejaVu", "", UNICODE_FONT, uni=True)
-                pdf.set_font("DejaVu", "", base_font_size)
-            except Exception:
-                pdf.set_font("Arial", "", base_font_size)
-        else:
-            pdf.set_font("Arial", "", base_font_size)
-
-        lines = normalize_ai_summary(summary_text).splitlines()
-        SECTION_TITLES = [
-            "Red Flags",
-            "Section by Section Analysis",
-            "YoY Inflation",
-            "Supply Shock Bins",
-            "Supply Shock",
-            "Supply Shock bins",
-            "Governance HHI",
-            "Liquidity Shield Ratio",
-            "Lockup Ratio",
-            "VC Dominance",
-            "Community Control Index",
-            "Emission Taper",
-            "Monte Carlo Survivability",
-            "Game Theory Score",
-        ]
-        current_section = None
-        inserted_image_for_current = False
-        for raw in lines:
-            line = raw.strip()
-            if not line:
-                continue
-
-            # Skip definition helper lines like 'Here ... means -'
-            if re.match(r'^here\b', line, flags=re.I):
-                continue
-
-            # Try to parse known section headers first (works for both "· YoY Inflation  ..." and "YoY Inflation — ...")
-            line_nobullet = _strip_leading_bullets(line)
-            split = _split_title_subtitle(line_nobullet, SECTION_TITLES)
-            if split is not None:
-                title, subtitle = split
-                # New section starts
-                current_section = title
-                inserted_image_for_current = False
-                pdf.ln(2)
-                # Render section title larger & bold; Heading 1 for top sections
-                is_redflags = (title.strip().lower() == 'red flags')
-                is_section2 = (title.strip().lower() == 'section by section analysis')
-                if is_redflags:
-                    pdf.set_text_color(200, 0, 0)
-                else:
-                    pdf.set_text_color(0, 0, 0)
-                if UNICODE_FONT:
-                    pdf.set_font("DejaVu", "", (base_font_size + 6) if (is_redflags or is_section2) else (base_font_size + 4))
-                else:
-                    pdf.set_font("Arial", "B", (base_font_size + 5) if (is_redflags or is_section2) else (base_font_size + 3))
-                pdf.multi_cell(effective_page_width, line_h + 3, sanitize_text(title_with_emoji(strip_md(title))))
-                # Subtitle (smaller / italic style)
-                if subtitle:
-                    if UNICODE_FONT:
-                        pdf.set_font("DejaVu", "", base_font_size + 0)
-                    else:
-                        pdf.set_font("Arial", "I", base_font_size)
-                    pdf.multi_cell(effective_page_width, line_h, sanitize_text(strip_md(subtitle)))
-                # Reset body font
-                pdf.set_text_color(0, 0, 0)
-                if UNICODE_FONT:
-                    pdf.set_font("DejaVu", "", base_font_size)
-                else:
-                    pdf.set_font("Arial", "", base_font_size)
-                # Hard reset X to left margin to avoid any drift before section body
-                pdf.set_x(pdf.l_margin)
-                pdf.ln(1)
-                continue
-
-            # Lines starting with '## ' should render bold without the '##'
-            m_hash = re.match(r'^##\s*(.+)$', line)
-            if m_hash:
-                text = strip_md(m_hash.group(1))
-                if UNICODE_FONT and 'DejaVu' in (pdf.font_family or '') and 'B' in (pdf.font_style or ''):
-                    # already bold, just render
-                    pass
-                try:
-                    if UNICODE_FONT and UNICODE_FONT_BOLD:
-                        pdf.set_font("DejaVu", "B", base_font_size)
-                    elif UNICODE_FONT:
-                        # Emulate bold with a slightly larger size
-                        pdf.set_font("DejaVu", "", base_font_size + 1)
-                    else:
-                        pdf.set_font("Arial", "B", base_font_size)
-                except Exception:
-                    pdf.set_font("Arial", "B", base_font_size)
-                pdf.multi_cell(effective_page_width, line_h, sanitize_text(text))
-                # Reset to body font
-                if UNICODE_FONT:
-                    pdf.set_font("DejaVu", "", base_font_size)
-                else:
-                    pdf.set_font("Arial", "", base_font_size)
-                pdf.ln(0.5)
-                continue
-
-            # If a line is a STAT/Impact line, render text (without the label); insert figure right after
-            if re.match(r"^(STAT|Impact)\b", line, flags=re.I):
-                if UNICODE_FONT:
-                    pdf.set_font("DejaVu", "", base_font_size)
-                else:
-                    pdf.set_font("Arial", "B", base_font_size)
-                left_margin = pdf.l_margin + INDENT
-                cur_y = pdf.get_y()
-                pdf.set_xy(left_margin, cur_y)
-                # Cleanup: remove 'STAT'/'STAT Impact' prefix and expand 'Y1–Y6:' pattern
-                clean = re.sub(r"^(STAT|Impact)\s*(Impact)?\s*[:\-—]?\s*", "", line, flags=re.I)
-                clean = re.sub(r"Y1\s*[–-]?\s*Y6\s*:\s*", "Y1, Y2, Y3, Y4, Y5, Y6: ", clean)
-                clean = re.sub(r"Y1Y6\s*:\s*", "Y1, Y2, Y3, Y4, Y5, Y6: ", clean)
-                # For YoY Inflation, bold the label prefix 'Y1, Y2, Y3, Y4, Y5, Y6:' and keep the rest normal
-                did_split = False
-                if current_section and 'yoy' in current_section.lower():
-                    m = re.match(r"^(\s*Y\s*1\s*,\s*Y\s*2\s*,\s*Y\s*3\s*,\s*Y\s*4\s*,\s*Y\s*5\s*,\s*Y\s*6\s*:)\s*(.*)$", strip_md(clean), flags=re.I)
-                    if m:
-                        label_txt = m.group(1).strip() + ' '
-                        body_txt = m.group(2).strip()
-                        # Bold label
-                        try:
-                            if UNICODE_FONT and UNICODE_FONT_BOLD:
-                                pdf.set_font("DejaVu", "B", base_font_size)
-                            elif UNICODE_FONT:
-                                pdf.set_font("DejaVu", "", base_font_size + 1)
-                            else:
-                                pdf.set_font("Arial", "B", base_font_size)
-                        except Exception:
-                            pdf.set_font("Arial", "B", base_font_size)
-                        pdf.cell(pdf.get_string_width(sanitize_text(label_txt)) + 1, line_h, sanitize_text(label_txt), ln=0)
-                        # Normal body
-                        if UNICODE_FONT:
-                            pdf.set_font("DejaVu", "", base_font_size)
-                        else:
-                            pdf.set_font("Arial", "", base_font_size)
-                        start_x = pdf.get_x()
-                        used_width = start_x - (pdf.l_margin + INDENT)
-                        pdf.multi_cell(effective_page_width - used_width, line_h, sanitize_text(body_txt))
-                        did_split = True
-                if not did_split:
-                    # Render full line in bold (fallback)
-                    try:
-                        if UNICODE_FONT and UNICODE_FONT_BOLD:
-                            pdf.set_font("DejaVu", "B", base_font_size)
-                        elif UNICODE_FONT:
-                            pdf.set_font("DejaVu", "", base_font_size + 1)
-                        else:
-                            pdf.set_font("Arial", "B", base_font_size)
-                    except Exception:
-                        pdf.set_font("Arial", "B", base_font_size)
-                    pdf.multi_cell(effective_page_width - INDENT, line_h, sanitize_text(strip_md(clean)))
-                pdf.set_xy(pdf.l_margin, pdf.get_y())
-                pdf.ln(0.5)
-                # Insert the figure once, immediately after STAT line
-                if not inserted_image_for_current:
-                    inserted_image_for_current = _insert_section_image_for(current_section)
-                continue
-
-            # Purpose (non-bullet) — bold label + normal body
-            if re.match(r'^purpose\b', line, flags=re.I):
-                left_margin = pdf.l_margin + INDENT
-                pdf.set_xy(left_margin, pdf.get_y())
-                body = re.sub(r'^purpose\s*[—:-]?\s*', '', line, flags=re.I)
-                try:
-                    if UNICODE_FONT and UNICODE_FONT_BOLD:
-                        pdf.set_font("DejaVu", "B", base_font_size)
-                    elif UNICODE_FONT:
-                        pdf.set_font("DejaVu", "", base_font_size + 1)
-                    else:
-                        pdf.set_font("Arial", "B", base_font_size)
-                except Exception:
-                    pdf.set_font("Arial", "B", base_font_size)
-                label = "Purpose — "
-                pdf.cell(pdf.get_string_width(sanitize_text(label)) + 1, line_h, sanitize_text(label), ln=0)
-                if UNICODE_FONT:
-                    pdf.set_font("DejaVu", "", base_font_size)
-                else:
-                    pdf.set_font("Arial", "", base_font_size)
-                start_x = pdf.get_x()
-                used_width = start_x - (pdf.l_margin + INDENT)
-                pdf.multi_cell(effective_page_width - used_width, line_h, sanitize_text(strip_md(body)))
-                pdf.set_xy(pdf.l_margin, pdf.get_y())
-                pdf.ln(0.5)
-                continue
-
-            # Suggestions header (non-bullet) — bold line
-            if re.match(r'^suggestions?\s*[:\-—]?\s*$', line, flags=re.I):
-                left_margin = pdf.l_margin + INDENT
-                pdf.set_xy(left_margin, pdf.get_y())
-                try:
-                    if UNICODE_FONT and UNICODE_FONT_BOLD:
-                        pdf.set_font("DejaVu", "B", base_font_size)
-                    elif UNICODE_FONT:
-                        pdf.set_font("DejaVu", "", base_font_size + 1)
-                    else:
-                        pdf.set_font("Arial", "B", base_font_size)
-                except Exception:
-                    pdf.set_font("Arial", "B", base_font_size)
-                pdf.multi_cell(effective_page_width - INDENT, line_h, sanitize_text("Suggestions —"))
-                if UNICODE_FONT:
-                    pdf.set_font("DejaVu", "", base_font_size)
-                else:
-                    pdf.set_font("Arial", "", base_font_size)
-                pdf.ln(0.5)
-                continue
-
-            # Price Impact bullet
-            if re.match(r"^(price\s*impact)\b", line, flags=re.I):
-                # Render as bullet list with a 'Price Impact —' label prefix
-                left_margin = pdf.l_margin + INDENT
-                cur_y = pdf.get_y()
-                pdf.set_xy(left_margin, cur_y)
-                pdf.cell(BULLET_CELL_W, line_h, BULLET, ln=0)
-                label = "Price Impact — "
-                if UNICODE_FONT:
-                    # DejaVu regular only; simulate emphasis by regular
-                    pdf.set_font("DejaVu", "", base_font_size)
-                else:
-                    pdf.set_font("Arial", "B", base_font_size)
-                safe_label = sanitize_text(label)
-                pdf.cell(pdf.get_string_width(safe_label) + 1, line_h, safe_label, ln=0)
-                body = re.sub(r"^(price\s*impact)\s*[—:-]?\s*", "", line, flags=re.I)
-                if UNICODE_FONT:
-                    pdf.set_font("DejaVu", "", base_font_size)
-                else:
-                    pdf.set_font("Arial", "", base_font_size)
-                start_x = pdf.get_x()
-                used_width = start_x - (pdf.l_margin + INDENT)
-                pdf.multi_cell(effective_page_width - used_width, line_h, sanitize_text(strip_md(body)))
-                pdf.set_xy(pdf.l_margin, pdf.get_y())
-                pdf.ln(0.5)
-                continue
-
-            # Bulleted lines
-            m_bullet = re.match(r'^([\-\*•·]+)\s+(.*)$', raw)
-            if m_bullet:
-                content = m_bullet.group(2).strip()
-                # Suggestions header (bullet) — bold line
-                if re.match(r'^suggestions?\s*[:\-—]?\s*$', content, flags=re.I):
-                    left_margin = pdf.l_margin + INDENT
-                    pdf.set_xy(left_margin, pdf.get_y())
-                    try:
-                        if UNICODE_FONT and UNICODE_FONT_BOLD:
-                            pdf.set_font("DejaVu", "B", base_font_size)
-                        elif UNICODE_FONT:
-                            pdf.set_font("DejaVu", "", base_font_size + 1)
-                        else:
-                            pdf.set_font("Arial", "B", base_font_size)
-                    except Exception:
-                        pdf.set_font("Arial", "B", base_font_size)
-                    pdf.multi_cell(effective_page_width - INDENT, line_h, sanitize_text("Suggestions —"))
-                    if UNICODE_FONT:
-                        pdf.set_font("DejaVu", "", base_font_size)
-                    else:
-                        pdf.set_font("Arial", "", base_font_size)
-                    pdf.set_xy(pdf.l_margin, pdf.get_y())
-                    pdf.ln(0.5)
-                    continue
-                # Skip definition bullets (Front-loaded / Back-loaded, Concentrated, etc.)
-                if re.match(r'^(front\-?loaded|back\-?loaded|moderate|concentrated|diffuse|mixed|low|high|below|at|above|tight|loose|elevated|modest|strong|weak|balanced)\s*:', content, flags=re.I):
-                    continue
-                # Bullet line that begins with '## ' → bold content without the hashes
-                m_b_content = re.match(r'^##\s*(.+)$', content)
-                if m_b_content:
-                    btxt = strip_md(m_b_content.group(1))
-                    left_margin = pdf.l_margin + INDENT
-                    cur_y = pdf.get_y()
-                    pdf.set_xy(left_margin, cur_y)
-                    pdf.cell(BULLET_CELL_W, line_h, BULLET, ln=0)
-                    try:
-                        if UNICODE_FONT and UNICODE_FONT_BOLD:
-                            pdf.set_font("DejaVu", "B", base_font_size)
-                        elif UNICODE_FONT:
-                            pdf.set_font("DejaVu", "", base_font_size + 1)
-                        else:
-                            pdf.set_font("Arial", "B", base_font_size)
-                    except Exception:
-                        pdf.set_font("Arial", "B", base_font_size)
-                    start_x = pdf.get_x()
-                    used_width = start_x - (pdf.l_margin + INDENT)
-                    pdf.multi_cell(effective_page_width - used_width, line_h, sanitize_text(btxt))
-                    # Reset font to body
-                    if UNICODE_FONT:
-                        pdf.set_font("DejaVu", "", base_font_size)
-                    else:
-                        pdf.set_font("Arial", "", base_font_size)
-                    pdf.set_xy(pdf.l_margin, pdf.get_y())
-                    pdf.ln(0.5)
-                    continue
-                # Purpose bullet — bold label + normal body
-                if re.match(r'^purpose\b', content, flags=re.I):
-                    left_margin = pdf.l_margin + INDENT
-                    pdf.set_xy(left_margin, pdf.get_y())
-                    body = re.sub(r'^purpose\s*[—:-]?\s*', '', content, flags=re.I)
-                    try:
-                        if UNICODE_FONT and UNICODE_FONT_BOLD:
-                            pdf.set_font("DejaVu", "B", base_font_size)
-                        elif UNICODE_FONT:
-                            pdf.set_font("DejaVu", "", base_font_size + 1)
-                        else:
-                            pdf.set_font("Arial", "B", base_font_size)
-                    except Exception:
-                        pdf.set_font("Arial", "B", base_font_size)
-                    label = "Purpose — "
-                    pdf.cell(pdf.get_string_width(sanitize_text(label)) + 1, line_h, sanitize_text(label), ln=0)
-                    if UNICODE_FONT:
-                        pdf.set_font("DejaVu", "", base_font_size)
-                    else:
-                        pdf.set_font("Arial", "", base_font_size)
-                    start_x = pdf.get_x()
-                    used_width = start_x - (pdf.l_margin + INDENT)
-                    pdf.multi_cell(effective_page_width - used_width, line_h, sanitize_text(strip_md(body)))
-                    pdf.set_xy(pdf.l_margin, pdf.get_y())
-                    pdf.ln(0.5)
-                    continue
-                # STAT bullet — render as plain line (YoY: bold label prefix), then insert figure
-                if content.upper().startswith("STAT") or content.upper().startswith("IMPACT"):
-                    if UNICODE_FONT:
-                        pdf.set_font("DejaVu", "", base_font_size)
-                    else:
-                        pdf.set_font("Arial", "B", base_font_size)
-                    left_margin = pdf.l_margin + INDENT
-                    cur_y = pdf.get_y()
-                    pdf.set_xy(left_margin, cur_y)
-                    clean = re.sub(r"^(STAT|Impact)\s*(Impact)?\s*[:\-—]?\s*", "", content, flags=re.I)
-                    clean = re.sub(r"Y1\s*[–-]?\s*Y6\s*:\s*", "Y1, Y2, Y3, Y4, Y5, Y6: ", clean)
-                    clean = re.sub(r"Y1Y6\s*:\s*", "Y1, Y2, Y3, Y4, Y5, Y6: ", clean)
-                    # YoY partial bold handling
-                    did_split = False
-                    if current_section and 'yoy' in current_section.lower():
-                        m = re.match(r"^(\s*Y\s*1\s*,\s*Y\s*2\s*,\s*Y\s*3\s*,\s*Y\s*4\s*,\s*Y\s*5\s*,\s*Y\s*6\s*:)\s*(.*)$", strip_md(clean), flags=re.I)
-                        if m:
-                            label_txt = m.group(1).strip() + ' '
-                            body_txt = m.group(2).strip()
-                            try:
-                                if UNICODE_FONT and UNICODE_FONT_BOLD:
-                                    pdf.set_font("DejaVu", "B", base_font_size)
-                                elif UNICODE_FONT:
-                                    pdf.set_font("DejaVu", "", base_font_size + 1)
-                                else:
-                                    pdf.set_font("Arial", "B", base_font_size)
-                            except Exception:
-                                pdf.set_font("Arial", "B", base_font_size)
-                            pdf.cell(pdf.get_string_width(sanitize_text(label_txt)) + 1, line_h, sanitize_text(label_txt), ln=0)
-                            if UNICODE_FONT:
-                                pdf.set_font("DejaVu", "", base_font_size)
-                            else:
-                                pdf.set_font("Arial", "", base_font_size)
-                            start_x = pdf.get_x()
-                            used_width = start_x - (pdf.l_margin + INDENT)
-                            pdf.multi_cell(effective_page_width - used_width, line_h, sanitize_text(body_txt))
-                            did_split = True
-                    if not did_split:
-                        try:
-                            if UNICODE_FONT and UNICODE_FONT_BOLD:
-                                pdf.set_font("DejaVu", "B", base_font_size)
-                            elif UNICODE_FONT:
-                                pdf.set_font("DejaVu", "", base_font_size + 1)
-                            else:
-                                pdf.set_font("Arial", "B", base_font_size)
-                        except Exception:
-                            pdf.set_font("Arial", "B", base_font_size)
-                        pdf.multi_cell(effective_page_width - INDENT, line_h, sanitize_text(strip_md(clean)))
-                    pdf.set_xy(pdf.l_margin, pdf.get_y())
-                    pdf.ln(0.5)
-                    if not inserted_image_for_current:
-                        inserted_image_for_current = _insert_section_image_for(current_section)
-                    continue
-                # Price Impact bullet — bullet + bold label
-                if re.match(r'^(price\s*impact)\b', content, flags=re.I):
-                    left_margin = pdf.l_margin + INDENT
-                    cur_y = pdf.get_y()
-                    pdf.set_xy(left_margin, cur_y)
-                    pdf.cell(BULLET_CELL_W, line_h, BULLET, ln=0)
-                    label = "Price Impact — "
-                    if UNICODE_FONT:
-                        pdf.set_font("DejaVu", "", base_font_size)
-                    else:
-                        pdf.set_font("Arial", "B", base_font_size)
-                    safe_label = sanitize_text(label)
-                    pdf.cell(pdf.get_string_width(safe_label) + 1, line_h, safe_label, ln=0)
-                    body = re.sub(r'^(price\s*impact)\s*[—:-]?\s*', '', content, flags=re.I)
-                    if UNICODE_FONT:
-                        pdf.set_font("DejaVu", "", base_font_size)
-                    else:
-                        pdf.set_font("Arial", "", base_font_size)
-                    start_x = pdf.get_x()
-                    used_width = start_x - (pdf.l_margin + INDENT)
-                    pdf.multi_cell(effective_page_width - used_width, line_h, sanitize_text(strip_md(body)))
-                    pdf.set_xy(pdf.l_margin, pdf.get_y())
-                    pdf.ln(0.5)
-                    continue
-
-                # Generic bullets (Suggestions or other) — keep bullets aligned
-                rest = strip_md(content)
-                left_margin = pdf.l_margin + INDENT
-                cur_y = pdf.get_y()
-                pdf.set_xy(left_margin, cur_y)
-                pdf.cell(BULLET_CELL_W, line_h, BULLET, ln=0)
-                start_x = pdf.get_x()
-                used_width = start_x - (pdf.l_margin + INDENT)
-                pdf.multi_cell(effective_page_width - used_width, line_h, sanitize_text(rest))
-                pdf.set_xy(pdf.l_margin, pdf.get_y())
-                pdf.ln(0.5)
-                continue
-
-            # Fallback: handle "Title — subtitle" if not caught earlier
-            if "—" in line and any(line.lower().startswith(n.lower()) for n in SECTION_TITLES):
-                parts = [p.strip() for p in line.split("—", 1)]
-                if len(parts) == 2:
-                    title = title_with_emoji(strip_md(parts[0]))
-                    subtitle = strip_md(parts[1])
-                    pdf.ln(2)
-                    pdf.set_text_color(80, 80, 80)
-                    if UNICODE_FONT:
-                        pdf.set_font("DejaVu", "", base_font_size + 4)
-                    else:
-                        pdf.set_font("Arial", "B", base_font_size + 3)
-                    pdf.multi_cell(effective_page_width, line_h + 2, sanitize_text(title))
-                    if subtitle:
-                        if UNICODE_FONT:
-                            pdf.set_font("DejaVu", "", base_font_size)
-                        else:
-                            pdf.set_font("Arial", "I", base_font_size)
-                        pdf.multi_cell(effective_page_width, line_h, sanitize_text(subtitle))
-                    pdf.set_text_color(0, 0, 0)
-                    if UNICODE_FONT:
-                        pdf.set_font("DejaVu", "", base_font_size)
-                    else:
-                        pdf.set_font("Arial", "", base_font_size)
-                    pdf.ln(1)
-                    continue
-
-            # Price Impact emphasis handled above
-
-            # Generic non-bullet fallback paragraph
-            pdf.set_x(pdf.l_margin)
-            pdf.multi_cell(effective_page_width, line_h, sanitize_text(strip_md(line)))
-            pdf.ln(1)
-
-        # After finishing all lines, add a small separation
-        pdf.ln(2)
-
-    def save_fig_temp(fig, name):
-        path = os.path.join(tempfile.gettempdir(), name)
-        fig.savefig(path, bbox_inches="tight")
-        return path
-
-    img1 = save_fig_temp(plt.gcf(), "curr_plot.png")  # not used directly but keeps matplotlib happy
-    img_infl = save_fig_temp(fig1, "inflation.png")
-    img_shock = save_fig_temp(fig2, "shock.png")
-    img_sim = save_fig_temp(fig3, "sim.png")
-
-    logo_path = _find_logo_path()
-    pdf = PDF(logo_path=logo_path)
-    # Slightly larger margins to avoid right-edge overflow
-    pdf.set_margins(15, 15, 15)
-    pdf.set_auto_page_break(auto=True, margin=15)
-    pdf.add_page()
-    # If unicode font exists, switch default body font to it (title font is handled in renderer)
-    if UNICODE_FONT:
+def _build_inputs() -> dict:
+    """Build inputs for Dify app. Merge optional JSON from secrets/env and set fallbacks
+    for common variables seen in workflows (structured_output, website, llm)."""
+    base: dict = {}
+    raw = _get_secret("DIFY_INPUTS_JSON", "")
+    if raw:
         try:
-            pdf.add_font("DejaVu", "", UNICODE_FONT, uni=True)
-            if UNICODE_FONT_BOLD:
-                pdf.add_font("DejaVu", "B", UNICODE_FONT_BOLD, uni=True)
-            pdf.set_font("DejaVu", "", 11)
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict):
+                base.update(parsed)
         except Exception:
-            pdf.set_font("Arial", size=11)
-    else:
-        pdf.set_font("Arial", size=11)
+            pass
+    base.setdefault("structured_output", False)
+    base.setdefault("website", "")
+    base.setdefault("llm", "")
+    return base
 
-    effective_page_width = pdf.w - 2 * pdf.l_margin
+# -----------------------------
+# Dify HTTP helpers
+# -----------------------------
 
-    # Render the AI summary with preserved structure and embed matching figures inline
-    section_images = {
-        'yoy inflation': img_infl,
-        'supply shock': img_shock,
-        'shock stopper': img_shock,
-        'monte carlo survivability': img_sim,
-        'monte carlo': img_sim,
-    }
-    render_structured_summary(pdf, summary, effective_page_width, base_font_size=11, section_images=section_images)
+def _headers(json_mode: bool = True) -> dict:
+    h = {"Authorization": f"Bearer {API_KEY}"}
+    if json_mode:
+        h["Content-Type"] = "application/json"
+    if APP_ID:
+        h["X-Dify-App-Id"] = APP_ID
+    return h
 
-    pdf.ln(4)
-    pdf.set_font("Arial", "B", 12)
-    pdf.multi_cell(0, 10, "Token Design by TDeFi")
-    pdf.set_font("Arial", "", 11)
-    tdefi_note = """
-Token engineering is not about distribution schedules or supply caps alone — it aligns incentives, behavior, and long-term value creation. A well-engineered token system creates harmony between product usage, network growth, and token demand. Poor token design often leads to value leakage and unsustainable emissions. At TDeFi, we build token models as economic engines — driven by utility, governed by logic, and sustained by real adoption.
 
-Designing for Demand, Not Just Distribution
-A common pitfall is decoupling emissions from real demand. When supply outpaces utility, it triggers sell pressure and a negative flywheel. Our approach ties token releases to verifiable demand — active users, protocol revenue, and ecosystem participation — rewarding value creation, not just speculation.
-""".strip()
-    for para in tdefi_note.split("\n\n"):
-        pdf.set_x(pdf.l_margin)
-        pdf.multi_cell(effective_page_width, 8, sanitize_text(para))
-        pdf.ln(1)
 
-    out = pdf.output(dest="S")
-    if isinstance(out, (bytes, bytearray)):
-        pdf_bytes = bytes(out)
-    else:
-        pdf_bytes = out.encode("latin-1", "ignore")
+def _infer_file_type(mime: str) -> str:
+    if not mime:
+        return "document"
+    if mime.startswith("image/"):
+        return "image"
+    if mime.startswith("audio/"):
+        return "audio"
+    if mime.startswith("video/"):
+        return "video"
+    return "document"
 
-    st.markdown("""
-    <div style="text-align: center; margin: 1.2rem 0;">
-        <h3>📄 Download Complete Report</h3>
-    </div>
-    """, unsafe_allow_html=True)
-    st.download_button(
-        "📄 Download PDF Report",
-        data=pdf_bytes,
-        file_name=f"{project_name}_Audit_Report.pdf",
-        mime="application/pdf"
+
+
+
+def dify_upload_file(file_name: str, file_bytes: bytes, mime: Optional[str], user: str) -> str:
+    """Upload a file to Dify for this conversation; returns upload_file_id."""
+    url = f"{API_BASE}/files/upload"
+    files = {"file": (file_name, file_bytes, mime or "application/octet-stream")} 
+    data = {"purpose": "conversation", "user": user}
+    resp = requests.post(url, headers={"Authorization": f"Bearer {API_KEY}"}, files=files, data=data, timeout=600)
+    if resp.status_code >= 400:
+        raise RuntimeError(f"Upload failed ({resp.status_code}): {resp.text}")
+    j = resp.json()
+    upload_id = j.get("id") or j.get("data", {}).get("id")
+    if not upload_id:
+        raise RuntimeError(f"Unexpected upload response: {j}")
+    return upload_id
+
+
+def dify_stream_chat(query: str, files_payload: Optional[List[dict]], user: str) -> Generator[str, None, None]:
+    payload = {"inputs": _build_inputs(), "query": query, "response_mode": "streaming", "user": user}
+    if st.session_state.conversation_id:
+        payload["conversation_id"] = st.session_state.conversation_id
+    if files_payload:
+        payload["files"] = files_payload
+
+    url = f"{API_BASE}/chat-messages"
+    with requests.post(url, headers=_headers(json_mode=True), json=payload, stream=True, timeout=1200) as r:
+        if r.status_code >= 400:
+            try:
+                err = r.json()
+            except Exception:
+                err = r.text
+            raise RuntimeError(f"{r.status_code}: {err}")
+        final_buffer = []
+        for raw in r.iter_lines(decode_unicode=True):
+            if not raw or raw.startswith(":"):
+                continue
+            if not raw.startswith("data:"):
+                continue
+            data_str = raw[5:].strip()
+            if not data_str:
+                continue
+            try:
+                evt = json.loads(data_str)
+            except Exception:
+                continue
+            conv_id = evt.get("conversation_id")
+            if conv_id and not st.session_state.conversation_id:
+                st.session_state.conversation_id = conv_id
+            event_type = evt.get("event")
+            # Stream incremental tokens when available
+            if event_type in ("message", "agent_message", "tool_message", "message_delta"):
+                delta = (evt.get("answer") or evt.get("output_text") or evt.get("data") or "")
+                if isinstance(delta, dict):
+                    delta = delta.get("text") or delta.get("content") or ""
+                if delta:
+                    final_buffer.append(str(delta))
+                    yield str(delta)
+            elif event_type in ("message_end", "agent_message_end", "completed", "workflow_finished"):
+                # Some Dify apps send only the final text on *_end events; make sure we surface it.
+                tail = (evt.get("answer") or evt.get("output_text") or "")
+                if isinstance(tail, dict):
+                    tail = tail.get("text") or tail.get("content") or ""
+                if tail:
+                    final_buffer.append(str(tail))
+                    yield str(tail)
+                break
+            elif event_type == "error":
+                err_msg = evt.get("message") or evt.get("error") or "Model error"
+                raise RuntimeError(err_msg)
+
+
+def dify_blocking_chat(query: str, files_payload: Optional[List[dict]], user: str, timeout_sec: int = 1200) -> str:
+    """Call Dify with response_mode=blocking and return the final answer text.
+    Ensures we wait for long-running workflows and still capture the final output.
+    """
+    payload = {"inputs": _build_inputs(), "query": query, "response_mode": "blocking", "user": user}
+    if st.session_state.conversation_id:
+        payload["conversation_id"] = st.session_state.conversation_id
+    if files_payload:
+        payload["files"] = files_payload
+
+    url = f"{API_BASE}/chat-messages"
+    r = requests.post(url, headers=_headers(json_mode=True), json=payload, timeout=timeout_sec)
+    if r.status_code >= 400:
+        try:
+            err = r.json()
+        except Exception:
+            err = r.text
+        raise RuntimeError(f"{r.status_code}: {err}")
+    j = r.json()
+    # Capture conversation id if present
+    conv_id = j.get("conversation_id") or j.get("result", {}).get("conversation_id")
+    if conv_id and not st.session_state.conversation_id:
+        st.session_state.conversation_id = conv_id
+
+    # Dify variants: answer, output_text, result.answer, data.text
+    def pick(obj: dict) -> Optional[str]:
+        if not isinstance(obj, dict):
+            return None
+        for key in ("answer", "output_text", "text", "content"):
+            val = obj.get(key)
+            if isinstance(val, str) and val.strip():
+                return val
+        return None
+
+    # Try several shapes
+    ans = pick(j) or pick(j.get("data", {})) or pick(j.get("result", {}))
+    if not ans:
+        # Some apps return a list of messages under data
+        data = j.get("data") or j.get("result") or {}
+        msgs = data.get("messages") if isinstance(data, dict) else None
+        if isinstance(msgs, list) and msgs:
+            for m in reversed(msgs):
+                ans = pick(m) or pick(m.get("data", {}))
+                if ans:
+                    break
+    if not ans:
+        raise RuntimeError("Dify returned no answer in blocking mode.")
+    return str(ans)
+
+# -----------------------------
+# Local Dify-output formatter -> Markdown (with optional OpenAI reformatter)
+# -----------------------------
+
+import re
+
+def _clean_lines(text: str) -> List[str]:
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    # Normalize bullets and dashes
+    text = text.replace("•", "-").replace("–", "-").replace("—", "-")
+    # Collapse repeated blank lines
+    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
+    lines = [ln.strip() for ln in text.split("\n")] 
+    return lines
+
+SECTION_TITLES = [
+    "Thanks for uploading",
+    "Here's What our Model Thinks",
+    "Reason",
+    "Strengths",
+    "Red Flags",
+    "Red Flags(High Priority Concerns)",
+    "Improvement Tips",
+    "Remove / Merge",
+    "Change",
+    "Consistency Check",
+    "The Action Plan",
+    "Data Points",
+    "Data Points (Can Include)",
+    "Schedule a Demo Call",
+]
+
+def _is_section_title(line: str) -> Optional[str]:
+    lower = line.lower().strip(': ')
+    for title in SECTION_TITLES:
+        if lower.startswith(title.lower().strip(': ')):
+            return title
+    # Heuristic: standalone line in Title Case without trailing punctuation
+    if len(line.split()) <= 8 and line.istitle():
+        return line
+    return None
+
+def _render_slide_block(block_lines: List[str]) -> str:
+    # Expect keys like Slide Name, Why, Bullets, Sources
+    out = []
+    cur = {}
+    bullets: List[str] = []
+    for ln in block_lines:
+        if re.match(r"^Slide\s*Name", ln, flags=re.I):
+            if cur or bullets:
+                # flush previous
+                if bullets:
+                    cur["Bullets"] = bullets[:]
+                    bullets.clear()
+                out.append(_render_slide(cur))
+                cur = {}
+            val = ln.split("Slide",1)[1]
+            val = val.split("Name",1)[-1]
+            val = val.replace(":", "").strip().strip('"')
+            cur["Slide Name"] = val
+        elif re.match(r"^Why", ln, flags=re.I):
+            cur["Why"] = ln.split(":",1)[-1].strip().strip('"') if ":" in ln else ln[3:].strip().strip('"')
+        elif re.match(r"^New\s*Title", ln, flags=re.I):
+            cur["New Title"] = ln.split(":",1)[-1].strip().strip('"') if ":" in ln else ln.split("New",1)[-1].strip().strip('"')
+        elif re.match(r"^Sources?", ln, flags=re.I):
+            cur["Sources"] = ln.split(":",1)[-1].strip().strip('"') if ":" in ln else ln
+        elif re.match(r"^(Bullets?)$", ln, flags=re.I):
+            continue
+        elif re.match(r"^[\-\*\u2022]", ln) or re.match(r"^\d+\.", ln):
+            bullets.append(re.sub(r"^\d+\.\s*", "", ln).lstrip("-*").strip())
+        elif ln:
+            # Treat as free text; append to Why if present else Notes
+            key = "Why" if "Why" in cur else "Notes"
+            cur[key] = (cur.get(key, "") + (" " if cur.get(key) else "") + ln).strip()
+    if cur or bullets:
+        if bullets:
+            cur["Bullets"] = bullets
+        out.append(_render_slide(cur))
+    return "\n\n".join([o for o in out if o])
+
+def _render_slide(data: dict) -> str:
+    title = data.get("Slide Name") or data.get("Title") or "Slide"
+    parts = [f"- **Slide Name**: {title}"]
+    if data.get("New Title"):
+        parts.append(f"- **New Title**: {data['New Title']}")
+    if data.get("Why"):
+        parts.append(f"- **Why**: {data['Why']}")
+    if data.get("Bullets"):
+        for b in data["Bullets"]:
+            parts.append(f"  - {b}")
+    if data.get("Sources"):
+        parts.append(f"- **Sources**: {data['Sources']}")
+    if data.get("Notes"):
+        parts.append(f"- **Notes**: {data['Notes']}")
+    return "\n".join(parts)
+
+def _format_block_as_list(block_lines: List[str]) -> str:
+    out = []
+    for ln in block_lines:
+        if not ln:
+            continue
+        if re.match(r"^[\-\*]", ln):
+            out.append(f"- {ln.lstrip('-* ').strip()}")
+        elif re.match(r"^\d+\.", ln):
+            out.append(re.sub(r"^(\d+)\.\s*", r"1. ", ln))
+        else:
+            out.append(ln)
+    return "\n".join(out)
+
+def format_dify_output(text: str) -> str:
+    # If OpenAI key present, try a light reformat via OpenAI first
+    if OPENAI_KEY:
+        try:
+            resp = requests.post(
+                "https://api.openai.com/v1/chat/completions",
+                headers={
+                    "Authorization": f"Bearer {OPENAI_KEY}",
+                    "Content-Type": "application/json",
+                },
+                json={
+                    "model": "gpt-4o-mini",
+                    "temperature": 0,
+                    "max_tokens": min(2048, max(300, len(text) // 4)),
+                    "messages": [
+                        {"role": "system", "content": (
+                            "Restructure the user's text into clear Markdown with short headings matching sections like 'Strengths', 'Red Flags', 'Improvement Tips', 'Remove / Merge', 'Change', 'Consistency Check', 'The Action Plan', 'Data Points'. "
+                            "Preserve wording; only add headings and bullets. Return ONLY Markdown."
+                        )},
+                        {"role": "user", "content": text},
+                    ],
+                },
+                timeout=60,
+            )
+            if resp.status_code < 400:
+                j = resp.json()
+                content = ((j.get("choices") or [{}])[0].get("message") or {}).get("content")
+                if content and content.strip():
+                    text = content.strip()
+        except Exception:
+            pass
+
+    lines = _clean_lines(text)
+    # Split into sections
+    sections = []  # (title, lines)
+    cur_title = None
+    cur_lines: List[str] = []
+    for ln in lines:
+        title = _is_section_title(ln)
+        if title and (not cur_title or ln.lower().startswith(title.lower())):
+            if cur_title or cur_lines:
+                sections.append((cur_title, cur_lines))
+            cur_title = title.strip(': ')
+            cur_lines = []
+        else:
+            cur_lines.append(ln)
+    if cur_title or cur_lines:
+        sections.append((cur_title, cur_lines))
+
+    # If no explicit sections found, just bulletize
+    if all(t is None for t, _ in sections):
+        return _format_block_as_list(lines)
+
+    rendered = []
+    for title, block in sections:
+        if title:
+            # Render headings without markdown hashes, as bold text
+            rendered.append(f"**{title.strip()}**")
+        # Detect slide-structured blocks under certain sections
+        if any(k in (title or "").lower() for k in ["improvement", "change", "remove"]):
+            rendered.append(_render_slide_block(block))
+        else:
+            rendered.append(_format_block_as_list(block))
+    # Final cleanup: collapse triple newlines
+    md = "\n\n".join([s.strip() for s in rendered if s and s.strip()])
+    # Put demo call link on the next line after the sentence (handles Schedule/Scheduled variants)
+    md = re.sub(
+        r"(Schedule(?:d)?\s+a\s+demo\s+call\s+with\s+us\s+for\s+more\s+insights:)\s*(\[[^\]]+\]\([^\)]+\)|https?://\S+|Demo\s+Call)",
+        r"\1\n\2",
+        md,
+        flags=re.IGNORECASE,
     )
+    md = re.sub(r"\n{3,}", "\n\n", md).strip()
+    return md
 
 # -----------------------------
-# Footer
+# Minimal single-shot UI with pre-upload + progress
 # -----------------------------
-st.markdown("""
-<div class="tdefi-powered">
-    🚀 Powered by <strong>TDeFi</strong> — TradeDog Token Growth Studio
-</div>
-""", unsafe_allow_html=True)
+
+accepted_mimes = [
+    "application/pdf",
+    "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+    "application/vnd.ms-powerpoint",
+    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+    "application/msword",
+    "text/plain",
+]
+
+files = st.file_uploader(
+    "Attach your pitch deck (PDF / PPT / DOCX)",
+    type=["pdf", "ppt", "pptx", "doc", "docx", "txt"],
+    accept_multiple_files=True,
+    help="Uploads are sent to Dify for this conversation.",
+    key=f"uploader_{st.session_state['uploader_key']}"
+)
+
+# Removed per request: external max-size line under the dropzone
+
+# Extra vertical breathing room under the banner
+st.markdown('<div class="spacer32"></div>', unsafe_allow_html=True)
+
+st.markdown('<div class="spacer24"></div>', unsafe_allow_html=True)
+st.markdown(
+    "<div style='text-align:center; color: #B7BEC9; font-size: 1.05rem; margin-bottom: 24px;'>PitchAudit AI analyzes your deck against proven investor templates, flags gaps, and rewrites slides using your content. Get a readiness score, must‑fix checklist, and clean exports.</div>",
+    unsafe_allow_html=True
+)
+
+# When user selects files, upload them immediately and show a progress bar.
+ready_to_start = False
+current_fps = []
+if files:
+    # Compute fingerprints and upload any new ones
+    total = len(files)
+    uploaded_count = 0
+    progress_bar_slot = st.empty()
+    progress_text_slot = st.empty()
+    bar = progress_bar_slot.progress(0)
+    progress_text_slot.caption(f"Uploading files… (0/{total})")
+
+    new_payload: List[dict] = []
+
+    for idx, uf in enumerate(files, start=1):
+        data = uf.getvalue()
+        # Enforce 15MB per file limit
+        if len(data) > 15 * 1024 * 1024:
+            size_mb = len(data) / (1024 * 1024)
+            progress_bar_slot.empty()
+            progress_text_slot.empty()
+            st.error(f"{uf.name} is {size_mb:.2f} MB. Maximum allowed is 15 MB.")
+            st.stop()
+        mime = uf.type or mimetypes.guess_type(uf.name)[0] or "application/octet-stream"
+        fp = hashlib.sha256(data).hexdigest()
+        current_fps.append(fp)
+
+        if fp not in st.session_state.uploaded_fps:
+            try:
+                upload_id = dify_upload_file(uf.name, data, mime, st.session_state.dify_user)
+                st.session_state.uploaded_fps[fp] = {
+                    "id": upload_id,
+                    "type": _infer_file_type(mime),
+                    "name": uf.name,
+                }
+            except Exception as e:
+                progress_bar_slot.empty()
+                progress_text_slot.empty()
+                st.error(f"Attachment upload failed — model is sleeping 😴. Try reloading.\n\nDetails: {e}")
+                st.stop()
+        # Build payload in current order
+        rec = st.session_state.uploaded_fps[fp]
+        new_payload.append({
+            "type": rec["type"],
+            "transfer_method": "local_file",
+            "upload_file_id": rec["id"],
+        })
+
+        uploaded_count = idx
+        pct = int((uploaded_count / total) * 100)
+        # Move smoothly
+        bar.progress(min(pct, 100))
+        progress_text_slot.caption(f"Uploading files… {uf.name} ({idx}/{total})")
+
+    # Remove entries for files no longer selected
+    to_keep = set(current_fps)
+    st.session_state.uploaded_fps = {k: v for k, v in st.session_state.uploaded_fps.items() if k in to_keep}
+
+    st.session_state.uploaded_payload = new_payload
+    progress_bar_slot.empty()
+    progress_text_slot.empty()
+    st.success(f"Files ready ✅  ({uploaded_count}/{total})")
+    ready_to_start = uploaded_count == total and total > 0
+else:
+    # If no files selected, reset uploaded payload
+    st.session_state.uploaded_payload = []
+
+# Start button enabled only after uploads finished
+start_placeholder = st.empty()
+start = start_placeholder.button("Start", type="primary", use_container_width=True, disabled=(not ready_to_start))
+
+if start:
+    # Remove the Start button and show a "Model is cooking…" label with a live progress bar
+    start_placeholder.empty()
+    cooking_text = st.empty()
+    cooking_text.markdown("<div style='text-align:center; color:#B7BEC9; margin: 6px 0;'>Model is cooking…</div>", unsafe_allow_html=True)
+
+    files_payload: List[dict] = st.session_state.uploaded_payload or []
+
+    RANDOM_QUERIES = [
+        "Scan this pitch deck and give a crisp summary (company, problem, solution, traction, ask).",
+        "Extract key metrics, GTM, business model, competitors and risks from this deck.",
+        "Summarize the opportunity, product, moat, and top 5 red flags in this deck.",
+        "Create a bullet summary of team, roadmap, market size, business model and funding ask.",
+    ]
+    query = random.choice(RANDOM_QUERIES)
+
+    try:
+        # Visual progress bar while the model is generating; fills to 90% gradually and 100% at completion.
+        prog_slot = st.empty()
+        prog = prog_slot.progress(0)
+
+        # Consume Dify stream silently, only track progress; do not display raw output
+        final_chunks: List[str] = []
+        pct = 0
+        for chunk in dify_stream_chat(query, files_payload or None, st.session_state.dify_user):
+            pct = min(90, pct + 2)
+            prog.progress(pct)
+            final_chunks.append(str(chunk))
+        prog.progress(95)
+
+        final_text = "".join(final_chunks).strip()
+        if not final_text:
+            # Fallback: wait for final result with blocking call
+            final_text = dify_blocking_chat(query, files_payload or None, st.session_state.dify_user)
+        prog.progress(100)
+
+        # Format the raw Dify output locally to match the structured style
+        final_output = format_dify_output(final_text)
+
+        # clear the progress UI once complete
+        prog_slot.empty()
+        cooking_text.empty()
+        st.session_state.last_output = final_output
+        st.markdown(f"<div class='result-box'>{final_output}</div>", unsafe_allow_html=True)
+    except Exception as e:
+        st.error("Model is sleeping 😴. Try to reload the app.")
+        with st.expander("Show technical details", expanded=False):
+            st.code(str(e))
+
+# Show last output if present (after rerun etc.)
+if st.session_state.get("last_output") and not start:
+    st.markdown(f"<div class='result-box'>{st.session_state.last_output}</div>", unsafe_allow_html=True)
