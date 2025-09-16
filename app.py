@@ -6,12 +6,14 @@
 #   NEXT_PUBLIC_APP_ID    (optional)
 
 import os
+import json
+import re
 import base64
 import random
 import mimetypes
 import uuid
 import hashlib
-from typing import List, Optional
+from typing import Generator, List, Optional
 
 import requests
 import streamlit as st
@@ -33,7 +35,6 @@ def _get_secret(name: str, default: Optional[str] = None) -> Optional[str]:
 API_BASE = _get_secret("NEXT_PUBLIC_API_URL", "https://api.dify.ai/v1").rstrip("/")
 API_KEY = _get_secret("NEXT_PUBLIC_APP_KEY", "")
 APP_ID = _get_secret("NEXT_PUBLIC_APP_ID", "")
-OPENAI_KEY = _get_secret("OPENAI_API_KEY", "")
 
 # Stable per-session user id (Dify requires a user identifier)
 if "dify_user" not in st.session_state:
@@ -176,9 +177,10 @@ with st.sidebar:
     # Info line under the button
     st.markdown("<div style='display:flex;align-items:center;gap:8px;color:#B7BEC9;font-size:0.9rem;'>ℹ️ <span>Reload if it doesn't respond in 60 sec.</span></div>", unsafe_allow_html=True)
 
-# Safety check for key (no sidebar inputs anymore)
+# Safety check for keys (required)
 if not API_KEY:
-    st.warning("Set NEXT_PUBLIC_APP_KEY as an environment variable or in .streamlit/secrets.toml to use the app.")
+    st.error("NEXT_PUBLIC_APP_KEY is required. Set it in your environment or .streamlit/secrets.toml.")
+    st.stop()
 
 # -----------------------------
 # Dify HTTP helpers
@@ -223,162 +225,140 @@ def dify_upload_file(file_name: str, file_bytes: bytes, mime: Optional[str], use
     return upload_id
 
 
-def dify_chat(query: str, files_payload: Optional[List[dict]], user: str) -> str:
-    """Call Dify in blocking mode and return the assistant's answer as text."""
-    payload = {"inputs": {}, "query": query, "response_mode": "blocking", "user": user}
+def dify_stream_chat(query: str, files_payload: Optional[List[dict]], user: str) -> Generator[str, None, None]:
+    payload = {"inputs": {}, "query": query, "response_mode": "streaming", "user": user}
     if st.session_state.conversation_id:
         payload["conversation_id"] = st.session_state.conversation_id
     if files_payload:
         payload["files"] = files_payload
 
     url = f"{API_BASE}/chat-messages"
-    resp = requests.post(url, headers=_headers(json_mode=True), json=payload, timeout=1200)
-    if resp.status_code >= 400:
-        try:
-            err = resp.json()
-        except Exception:
-            err = resp.text
-        raise RuntimeError(f"{resp.status_code}: {err}")
+    with requests.post(url, headers=_headers(json_mode=True), json=payload, stream=True, timeout=1200) as r:
+        if r.status_code >= 400:
+            try:
+                err = r.json()
+            except Exception:
+                err = r.text
+            raise RuntimeError(f"{r.status_code}: {err}")
+        final_buffer = []
+        for raw in r.iter_lines(decode_unicode=True):
+            if not raw or raw.startswith(":"):
+                continue
+            if not raw.startswith("data:"):
+                continue
+            data_str = raw[5:].strip()
+            if not data_str:
+                continue
+            try:
+                evt = json.loads(data_str)
+            except Exception:
+                continue
+            conv_id = evt.get("conversation_id")
+            if conv_id and not st.session_state.conversation_id:
+                st.session_state.conversation_id = conv_id
+            event_type = evt.get("event")
+            # Stream incremental tokens when available
+            if event_type in ("message", "agent_message", "tool_message", "message_delta"):
+                delta = (evt.get("answer") or evt.get("output_text") or evt.get("data") or "")
+                if isinstance(delta, dict):
+                    delta = delta.get("text") or delta.get("content") or ""
+                if delta:
+                    final_buffer.append(str(delta))
+                    yield str(delta)
+            elif event_type in ("message_end", "agent_message_end", "completed", "workflow_finished"):
+                # Some Dify apps send only the final text on *_end events; make sure we surface it.
+                tail = (evt.get("answer") or evt.get("output_text") or "")
+                if isinstance(tail, dict):
+                    tail = tail.get("text") or tail.get("content") or ""
+                if tail:
+                    final_buffer.append(str(tail))
+                    yield str(tail)
+                break
+            elif event_type == "error":
+                err_msg = evt.get("message") or evt.get("error") or "Model error"
+                raise RuntimeError(err_msg)
 
-    try:
-        body = resp.json()
-    except Exception as exc:
-        raise RuntimeError(f"Invalid JSON from Dify: {resp.text}") from exc
+# -----------------------------
+# Local post-processor to structure raw text
+# -----------------------------
 
-    conv_id = (
-        body.get("conversation_id")
-        or body.get("data", {}).get("conversation_id")
-        or body.get("data", {}).get("conversation", {}).get("id")
-    )
-    if conv_id:
-        st.session_state.conversation_id = conv_id
 
-    # Pull any textual answer from the response payload
-    candidates = [
-        body.get("answer"),
-        body.get("output_text"),
-        body.get("message"),
-        body.get("data"),
-    ]
-    text = ""
-    for candidate in candidates:
-        text = _collapse_text(candidate)
-        if text:
-            break
-
-    # Fallback: collapse the full body if needed
+def _looks_like_markdown(text: str) -> bool:
     if not text:
-        text = _collapse_text(body)
+        return False
+    if "```" in text or re.search(r"(^|\n)\s*#{1,6}\s", text):
+        return True
+    if re.search(r"(^|\n)\s*(?:[-*•]|\d+\.)\s+", text):
+        return True
+    return False
 
-    text = (text or "").strip()
+
+def _split_sentences(line: str) -> List[str]:
+    parts = re.split(r"(?<=[.!?])\s+(?=[A-Z0-9])", line.strip())
+    return [p.strip() for p in parts if p.strip()]
+
+
+def _format_line_to_markdown(line: str) -> List[str]:
+    line = line.strip()
+    if not line:
+        return []
+    if line.startswith(tuple("-*•–")) or re.match(r"^\d+\.\s+", line):
+        cleaned = re.sub(r"^[\-*•–\d\.\s]+", "", line)
+        return [f"- {cleaned.strip()}"]
+    if ":" in line:
+        key, value = line.split(":", 1)
+        if len(key.strip()) <= 40:
+            return [f"- **{key.strip()}:** {value.strip()}"]
+    if ";" in line and not line.endswith(";"):
+        parts = [part.strip() for part in line.split(";") if part.strip()]
+        if len(parts) > 1:
+            return [f"- {part}" for part in parts]
+    sentences = _split_sentences(line)
+    if len(sentences) > 1:
+        return [f"- {sentence}" for sentence in sentences]
+    return [f"- {line}"]
+
+
+def _format_output(text: str) -> str:
+    """Format raw Dify text into lightweight Markdown locally."""
     if not text:
-        raise RuntimeError(f"Pitch Audit AI returned an unexpected response payload: {body}")
-
-    st.session_state["_dify_last_raw"] = text
-    return text
-
-
-# -----------------------------
-# OpenAI minimal post-processor (optional)
-# -----------------------------
-
-
-def _restructure_with_openai(text: str) -> Optional[str]:
-    """Lightly restructure text via OpenAI if key is provided."""
-    if not OPENAI_KEY:
-        return None
-    approx_tokens = max(256, min(2048, max(300, len(text) // 4)))
-    try:
-        resp = requests.post(
-            "https://api.openai.com/v1/chat/completions",
-            headers={
-                "Authorization": f"Bearer {OPENAI_KEY}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": "gpt-4o-mini",
-                "temperature": 0,
-                "max_tokens": approx_tokens,
-                "messages": [
-                    {"role": "system", "content": (
-                        "You are a formatting assistant. Restructure the user's text into clear Markdown with short headings and concise bullet lists. "
-                        "Do not add, remove, or paraphrase content; only reformat and lightly group. Be token-efficient and return only the reformatted text."
-                    )},
-                    {"role": "user", "content": f"Format the following text without changing meaning or length.\n\n{text}"},
-                ],
-            },
-            timeout=60,
-        )
-        if resp.status_code >= 400:
-            return None
-        j = resp.json()
-        choice = (j.get("choices") or [{}])[0]
-        content = ((choice.get("message") or {}).get("content")) or None
-        if content and content.strip():
-            return content
-        return None
-    except Exception:
-        return None
-
-
-# -----------------------------
-# Helpers to collapse nested Dify payloads into plaintext
-# -----------------------------
-
-
-def _collapse_text(value) -> str:
-    """Extract readable text from nested structures returned by Dify."""
-    if value is None:
         return ""
-    if isinstance(value, (str, int, float)):
-        return str(value).strip()
-    if isinstance(value, list):
-        parts = [_collapse_text(item) for item in value]
-        return "\n".join(part for part in parts if part)
-    if isinstance(value, dict):
-        parts: List[str] = []
-        preferred_keys = (
-            "answer",
-            "output_text",
-            "text",
-            "content",
-            "message",
-            "value",
-            "result",
-            "display_text",
-        )
-        for key in preferred_keys:
-            if key in value:
-                part = _collapse_text(value[key])
-                if part:
-                    parts.append(part)
+    if _looks_like_markdown(text):
+        return text
 
-        container_keys = (
-            "outputs",
-            "messages",
-            "items",
-            "segments",
-            "choices",
-            "values",
-            "children",
-            "data",
-        )
-        for key in container_keys:
-            if key in value:
-                part = _collapse_text(value[key])
-                if part:
-                    parts.append(part)
+    paragraphs = [p.strip() for p in re.split(r"\n\s*\n", text.strip()) if p.strip()]
+    formatted_sections: List[str] = []
 
-        # As a last resort, look at any remaining nested values
-        if not parts:
-            for sub_value in value.values():
-                part = _collapse_text(sub_value)
-                if part:
-                    parts.append(part)
+    for para in paragraphs:
+        lines = [line.strip() for line in para.splitlines() if line.strip()]
+        if not lines:
+            continue
 
-        return "\n".join(part for part in parts if part)
-    return ""
+        heading = None
+        body_lines = lines
 
+        first = lines[0]
+        if len(lines) > 1:
+            if first.endswith(":"):
+                heading = first[:-1].strip()
+                body_lines = lines[1:]
+            elif len(first) <= 60 and first[0].isalpha() and first == first.title():
+                heading = first
+                body_lines = lines[1:]
+
+        section_parts: List[str] = []
+        if heading:
+            section_parts.append(f"### {heading}")
+
+        for line in body_lines:
+            section_parts.extend(_format_line_to_markdown(line))
+
+        if not section_parts:
+            section_parts = [para]
+
+        formatted_sections.append("\n".join(section_parts))
+
+    return "\n\n".join(formatted_sections) if formatted_sections else text
 
 # -----------------------------
 # Minimal single-shot UI with pre-upload + progress
@@ -493,6 +473,9 @@ if start:
 
     RANDOM_QUERIES = [
         "Scan this pitch deck and give a crisp summary (company, problem, solution, traction, ask).",
+        "Extract key metrics, GTM, business model, competitors and risks from this deck.",
+        "Summarize the opportunity, product, moat, and top 5 red flags in this deck.",
+        "Create a bullet summary of team, roadmap, market size, business model and funding ask.",
     ]
     query = random.choice(RANDOM_QUERIES)
 
@@ -500,12 +483,22 @@ if start:
         # Visual progress bar while the model is generating; fills to 90% gradually and 100% at completion.
         prog_slot = st.empty()
         prog = prog_slot.progress(0)
-        prog.progress(10)
 
-        final_text = dify_chat(query, files_payload or None, st.session_state.dify_user).strip()
+        # Consume Dify stream silently, only track progress; do not display raw output
+        final_chunks: List[str] = []
+        pct = 0
+        for chunk in dify_stream_chat(query, files_payload or None, st.session_state.dify_user):
+            pct = min(90, pct + 2)
+            prog.progress(pct)
+            final_chunks.append(str(chunk))
         prog.progress(100)
 
-        structured = _restructure_with_openai(final_text)
+        final_text = "".join(final_chunks).strip()
+        if not final_text:
+            raise RuntimeError("Pitch Audit AI returned an empty response. Try again in a moment.")
+
+        # Restructure locally; fall back to raw text if the formatter returns placeholder copy
+        structured = _format_output(final_text)
         cleaned_structured = (structured or "").strip()
         placeholder_phrases = {
             "please provide the text you would like me to format",
