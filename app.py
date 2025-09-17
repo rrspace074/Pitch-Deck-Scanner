@@ -486,10 +486,12 @@ Global formatting rules
 - One blank line between sections. No extra blank lines inside items.
 
 Required section order & shapes
+
 Thanks for uploading Pitch Deck, Model is cooking
+
 Please wait.
 
-You can also do your token audit using our Tokenomics Audit Tool: https://www.tokenomics.checker.tde.fi/
+You can also do your token audit using our Tokenomics Audit Tool: https://www.tokenomics.checker.tde.fi/ (link)
 
 Here's What our Model Thinks For Pitch Deck: (Just for refernce)
 Need Some Changes
@@ -538,9 +540,10 @@ Reason
 9) **Data Points (Can Include)**
 - A simple bullet list of concrete numbers/tables to collect.
 
-10) **Schedule a Demo Call**
-- Put the bold title on one line: **Schedule a Demo Call**
-- On the very next line, print ONLY a single link (no bullets or extra text). If multiple links appear, pick the most relevant single link.
+
+Scheduled a demo call with us for more insights:
+
+https://calendly.com/tdefi_project_calls/45min (as a link)
 
 Normalization & cleanup
 - Convert any '•' or odd bullets → '- '.
@@ -613,20 +616,6 @@ Return ONLY the formatted Markdown."""},
             rendered.append(_format_block_as_list(block))
     # Final cleanup: collapse triple newlines
     md = "\n\n".join([s.strip() for s in rendered if s and s.strip()])
-    # Put demo call link on the next line after the sentence (handles Schedule/Scheduled variants)
-    md = re.sub(
-        r"(Schedule(?:d)?\s+a\s+demo\s+call\s+with\s+us\s+for\s+more\s+insights:)\s*(\[[^\]]+\]\([^\)]+\)|https?://\S+|Demo\s+Call)",
-        r"\1\n\2",
-        md,
-        flags=re.IGNORECASE,
-    )
-    # Ensure the 'Schedule a Demo Call' header has the link on the very next line (no bullets)
-    md = re.sub(
-        r"\*\*Schedule a Demo Call\*\*\s*(?:-\s*)?(\[[^\]]+\]\([^)]+\)|https?://\S+)",
-        r"**Schedule a Demo Call**\n\1",
-        md,
-        flags=re.IGNORECASE,
-    )
     md = re.sub(r"\n{3,}", "\n\n", md).strip()
     return md
 
