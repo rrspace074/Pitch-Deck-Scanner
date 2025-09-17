@@ -378,15 +378,24 @@ def format_with_openai(text: str) -> str:
                         "content": """You are a strict Markdown formatter.
 Your ONLY job: take whatever text the user provides (messy, unstructured, or chatty) and rewrite it into the exact schema below. Do not add greetings, explanations, or extra lines. No code blocks.
 
+Look into the Output Format Example and Strictly Follow that Format.
+
 Global formatting rules
 - Titles are **bold lines** (no # headings, no trailing colons).
 - Bullets must use '- ' only (dash + space). No other bullet glyphs.
 - Numbered lists are allowed (1., 2., …) where specified.
 - Keep meaning and wording where possible; fix obvious grammar/spelling lightly.
-- Strip ALL preamble/epilogue such as “Thanks for uploading…”, ads, or unrelated links.
 - One blank line between sections. No extra blank lines inside items.
 
 Required section order & shapes
+
+Thanks for uploading Pitch Deck, Model is cooking Please wait.
+
+You can also do your Token audit using our Tokenomics Audit Tool: https://www.tokenomics.checker.tde.fi/
+
+Here's What our Model Thinks For Pitch Deck:
+Need Multiple Changes
+
 1) **Strengths**
 - A simple bullet list. Each item starts with '- '.
 
@@ -427,9 +436,8 @@ Required section order & shapes
 9) **Data Points (Can Include)**
 - A simple bullet list of concrete numbers/tables to collect.
 
-10) **Schedule a Demo Call**
-- Put the bold title on one line: **Schedule a Demo Call**
-- On the very next line, print ONLY a single link (no bullets or extra text). If multiple links appear, pick the most relevant single link.
+- Schedule a Demo Call
+https://calendly.com/tdefi_project_calls/45min
 
 Normalization & cleanup
 - Convert any '•' or odd bullets → '- '.
@@ -552,7 +560,7 @@ Data Points (Can Include)
 Schedule a Demo Call
 https://calendly.com/tdefi_project_calls/45min"
 
-Return ONLY the formatted Markdown."""
+"""
                     },
                     {"role": "user", "content": text},
                 ],
