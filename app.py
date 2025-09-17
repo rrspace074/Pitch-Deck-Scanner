@@ -372,6 +372,7 @@ SECTION_TITLES = [
     "Red Flags",
     "Red Flags(High Priority Concerns)",
     "Improvement Tips",
+    "Add",
     "Remove / Merge",
     "Change",
     "Consistency Check",
@@ -473,13 +474,87 @@ def format_dify_output(text: str) -> str:
                     "temperature": 0,
                     "max_tokens": min(2048, max(300, len(text) // 4)),
                     "messages": [
-                        {"role": "system", "content": (
-                            "Return clean Markdown with: (1) section titles as bold lines (no # hashes), (2) bullet points using '- ' only, (3) numeric lists allowed, (4) keep wording, (5) no code blocks.\n"
-                            "Target sections include 'Strengths', 'Red Flags (High Priority Concerns)', 'Improvement Tips', 'Add', 'Remove / Merge', 'Change', 'Consistency Check', 'The Action Plan', 'Data Points (Can Include)', 'Schedule a Demo Call (this & link should be on the next line)'.\n"
-                            "Example style:\n"
-                            "**Improvement Tips**\n- **Slide Name**: Competition & Differentiation\n  - Why: Investors need to compare against peers.\n  - Bullets\n    - Top competitors...\n    - Your edge...\n\n"
-                            "Do not use heading hashes; use bold for titles only."
-                        )},
+                        {"role": "system", "content": """You are a strict Markdown formatter.
+Your ONLY job: take whatever text the user provides (messy, unstructured, or chatty) and rewrite it into the exact schema below. Do not add greetings, explanations, or extra lines. No code blocks.
+
+Global formatting rules
+- Titles are **bold lines** (no # headings, no trailing colons).
+- Bullets must use '- ' only (dash + space). No other bullet glyphs.
+- Numbered lists are allowed (1., 2., …) where specified.
+- Keep meaning and wording where possible; fix obvious grammar/spelling lightly.
+- Strip ALL preamble/epilogue such as “Thanks for uploading…”, ads, or unrelated links.
+- One blank line between sections. No extra blank lines inside items.
+
+Required section order & shapes
+Thanks for uploading Pitch Deck, Model is cooking
+Please wait.
+
+You can also do your token audit using our Tokenomics Audit Tool: https://www.tokenomics.checker.tde.fi/
+
+Here's What our Model Thinks For Pitch Deck: (Just for refernce)
+Need Some Changes
+
+Reason
+
+- Deck has strong vision and traction but lacks clear competition, business metrics, and more detail on go-to-market execution. (Just for refernce)
+
+1) **Strengths**
+- A simple bullet list. Each item starts with '- '.
+
+2) **Red Flags (High Priority Concerns)**
+- A simple bullet list of the top issues. Each item starts with '- '.
+
+3) **Improvement Tips**
+- Use a numbered list.
+- For each item, nest the following lines exactly:
+  - **Slide Name**: &lt;Title&gt;
+  - Why: &lt;1–2 sentences&gt;
+  - Bullets:
+    - &lt;point&gt;
+    - &lt;point&gt;
+  - Sources: &lt;short reference or "Not specified"&gt;
+
+ **Add**
+- Numbered list. Same 4 sub-lines as above. Use for NEW slides/content. If nothing to add, write '- None.'.
+
+ **Remove / Merge**
+- Numbered list. Same 4 sub-lines as above. In 'Why', state what to remove/merge and why.
+
+ **Change**
+- Numbered list. Same 4 sub-lines **plus** a line for a new title if present:
+  - **Slide Name**: &lt;Current Title&gt;
+  - New Title: &lt;New Title&gt;  (omit if not applicable)
+  - Why: &lt;...&gt;
+  - Bullets:
+    - &lt;point&gt;
+  - Sources: &lt;...&gt;
+
+7) **Consistency Check**
+- A simple bullet list of cross-checks/contradictions. If none, '- None noted.'.
+
+8) **The Action Plan**
+- A simple bullet list of next actions (5–8 concise bullets).
+
+9) **Data Points (Can Include)**
+- A simple bullet list of concrete numbers/tables to collect.
+
+10) **Schedule a Demo Call**
+- Put the bold title on one line: **Schedule a Demo Call**
+- On the very next line, print ONLY a single link (no bullets or extra text). If multiple links appear, pick the most relevant single link.
+
+Normalization & cleanup
+- Convert any '•' or odd bullets → '- '.
+- Remove quotes around slide names (example: - **Slide Name**: Competition &amp; Differentiation).
+- If a required field is missing, write a concise placeholder (e.g., - Sources: Not specified).
+- If the input mentions 'Add:' items inside other sections, move them under **Add** with the proper structure.
+
+Self-check before finalizing (do NOT print this checklist)
+- All 10 sections appear in the exact order and with bold titles (no '#').
+- Bullets use only '- '; sub-bullets are indented by two spaces then '- '.
+- 'Improvement Tips', 'Add', 'Remove / Merge', and 'Change' use numbered items, each containing the required sub-lines.
+- The final section shows the link on its own line (no bullets/text).
+
+Return ONLY the formatted Markdown."""},
                         {"role": "user", "content": text},
                     ],
                 },
@@ -532,7 +607,7 @@ def format_dify_output(text: str) -> str:
             # Render headings without markdown hashes, as bold text
             rendered.append(f"**{title.strip()}**")
         # Detect slide-structured blocks under certain sections
-        if any(k in (title or "").lower() for k in ["improvement", "change", "remove"]):
+        if any(k in (title or "").lower() for k in ["improvement", "change", "remove", "add"]):
             rendered.append(_render_slide_block(block))
         else:
             rendered.append(_format_block_as_list(block))
@@ -542,6 +617,13 @@ def format_dify_output(text: str) -> str:
     md = re.sub(
         r"(Schedule(?:d)?\s+a\s+demo\s+call\s+with\s+us\s+for\s+more\s+insights:)\s*(\[[^\]]+\]\([^\)]+\)|https?://\S+|Demo\s+Call)",
         r"\1\n\2",
+        md,
+        flags=re.IGNORECASE,
+    )
+    # Ensure the 'Schedule a Demo Call' header has the link on the very next line (no bullets)
+    md = re.sub(
+        r"\*\*Schedule a Demo Call\*\*\s*(?:-\s*)?(\[[^\]]+\]\([^)]+\)|https?://\S+)",
+        r"**Schedule a Demo Call**\n\1",
         md,
         flags=re.IGNORECASE,
     )
