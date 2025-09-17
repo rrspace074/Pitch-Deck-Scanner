@@ -557,7 +557,130 @@ Self-check before finalizing (do NOT print this checklist)
 - 'Improvement Tips', 'Add', 'Remove / Merge', and 'Change' use numbered items, each containing the required sub-lines.
 - The final section shows the link on its own line (no bullets/text).
 
-Return ONLY the formatted Markdown."""},
+Return ONLY the formatted Markdown.
+
+Output Structure Example 
+"
+Thanks for uploading Pitch Deck, Model is cooking Please wait.
+
+You can also do your Token audit using our Tokenomics Audit Tool: https://www.tokenomics.checker.tde.fi/
+
+Here's What our Model Thinks For Pitch Deck:
+
+Need Multiple Changes
+
+Reason
+
+Lacks business model, competition, ask, and use of funds; missing market positioning essentials.
+
+Strengths
+	•	Shows real traction with 60K+ active users and notable partnerships.
+	•	Clearly states the problem of centralized AI agent risks and why privacy-first matters now.
+	•	Presents a technically differentiated solution (open-source protocols, cross-chain interoperability).
+
+Red Flags (High Priority Concerns)
+	•	No clear competitive landscape comparing SINT to leading AI/Web3 agent platforms.
+	•	ICPs and use cases are broad; target segments and personas need sharpening.
+	•	Funding ask lacks breakdown by category, runway, and milestones.
+	•	Unit economics/pricing are unclear; need early monetization proof points.
+	•	Traction by segment and conversion/retention metrics are missing.
+
+Improvement Tips
+1.
+	•	Slide Name: Competition & Differentiation
+	•	Why: Investors must see direct comparisons and SINT’s edge over decentralized and centralized alternatives.
+	•	Bullets:
+	•	List top competitors (e.g., Fetch.ai, SingularityNET, Phala Network) and feature/funding/user comparisons.
+	•	Highlight unique moat (e.g., MCP protocol, confidential compute stack).
+	•	Sources: Not specified.
+
+	2.	
+
+	•	Slide Name: Go-To-Market Playbook
+	•	Why: Needs concrete tactics per target segment from pilot → paid → scale.
+	•	Bullets:
+	•	Define ICPs, channels, and onboarding funnel with metrics.
+	•	Include a pilot case study and milestone timeline.
+	•	Sources: GTM broad in current deck.
+
+	3.	
+
+	•	Slide Name: Tokenomics Deep Dive
+	•	Why: Investors expect clear token utility, allocation, and emissions logic.
+	•	Bullets:
+	•	Allocation pie chart and vesting schedule.
+	•	Emissions/burn logic over time.
+	•	Sources: Only surface-level token info present.
+
+Add
+1.
+	•	Slide Name: Competition & Differentiation
+	•	Why: Deck lacks an explicit competitor view; investors need apples-to-apples comparison.
+	•	Bullets:
+	•	Competitor matrix (features/users/funding).
+	•	Why partners choose SINT; evidence of switching.
+	•	Sources: Not specified.
+
+	2.	
+
+	•	Slide Name: Go-To-Market Execution Plan
+	•	Why: Must show how you’ll acquire, convert, and retain initial ICPs.
+	•	Bullets:
+	•	First ICPs, channels, and growth loop.
+	•	Pilot → paid conversion metrics and targets.
+	•	Sources: GTM sections are generic.
+
+Remove / Merge
+1.
+	•	Slide Name: Revenue from Partnerships
+	•	Why: Repetitive with Business Model; merge for clarity.
+	•	Bullets:
+	•	Consolidate revenue details into the Business Model slide.
+	•	Sources: Duplicates existing content.
+
+Change
+1.
+	•	Slide Name: Business Model
+	•	New Title: How SINT Makes Money & Scales Revenue
+	•	Why: Current slide lists channels but lacks pricing/examples and scalability proof.
+	•	Bullets:
+	•	Show revenue streams with example pricing per user/partner type.
+	•	Add early results or projections; explain % split logic vs. norms.
+	•	Sources: Existing “Commissions/Subscriptions/Marketplace” references.
+
+	2.	
+
+	•	Slide Name: Market Opportunity
+	•	New Title: Market Size & Segmentation
+	•	Why: Needs TAM split by segments and priority focus with sources.
+	•	Bullets:
+	•	Break out $TAM by segment and cite sources for each figure.
+	•	Clarify priority segments and near-term addressable market.
+	•	Sources: TAM noted without detail.
+
+Consistency Check
+	•	$600k seed closed vs. $3.6M ask later—clarify whether this is a new round or cumulative.
+	•	Revenue projections appear aggressive without conversion math.
+	•	Initial circulating supply % has inconsistencies (if token is included).
+
+The Action Plan
+	•	Build a competitor matrix versus Fetch.ai, SingularityNET, Phala Network.
+	•	Define ICPs and priority use cases; tie to channel tactics and milestones.
+	•	Break down the $3.6M raise into categories mapped to runway and milestones.
+	•	Add unit economics (pricing, margins) with worked examples.
+	•	Collect activation, retention, and pilot → paid conversion metrics.
+	•	Create a tokenomics deep-dive slide with allocation/vesting/emissions.
+
+Data Points (Can Include)
+	•	Recent MAU/PAU and cohort retention (D7/D30).
+	•	Pricing tiers/examples per revenue stream.
+	•	Competition research table (features/adoption/funding).
+	•	Fundraising ask, valuation context, runway, and milestone plan.
+	•	CAC/LTV/payback/churn where available.
+
+Schedule a Demo Call
+https://calendly.com/tdefi_project_calls/45min"
+"""},
                         {"role": "user", "content": text},
                     ],
                 },
