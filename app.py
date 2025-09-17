@@ -349,132 +349,33 @@ def dify_blocking_chat(query: str, files_payload: Optional[List[dict]], user: st
         raise RuntimeError("Dify returned no answer in blocking mode.")
     return str(ans)
 
+
 # -----------------------------
-# Local Dify-output formatter -> Markdown (with optional OpenAI reformatter)
+# OpenAI-only Dify-output formatter
 # -----------------------------
 
-import re
-
-def _clean_lines(text: str) -> List[str]:
-    text = text.replace("\r\n", "\n").replace("\r", "\n")
-    # Normalize bullets and dashes
-    text = text.replace("•", "-").replace("–", "-").replace("—", "-")
-    # Collapse repeated blank lines
-    text = re.sub(r"\n\s*\n\s*\n+", "\n\n", text)
-    lines = [ln.strip() for ln in text.split("\n")] 
-    return lines
-
-SECTION_TITLES = [
-    "Thanks for uploading",
-    "Here's What our Model Thinks",
-    "Reason",
-    "Strengths",
-    "Red Flags",
-    "Red Flags(High Priority Concerns)",
-    "Improvement Tips",
-    "Add",
-    "Remove / Merge",
-    "Change",
-    "Consistency Check",
-    "The Action Plan",
-    "Data Points",
-    "Data Points (Can Include)",
-    "Schedule a Demo Call",
-]
-
-def _is_section_title(line: str) -> Optional[str]:
-    lower = line.lower().strip(': ')
-    for title in SECTION_TITLES:
-        if lower.startswith(title.lower().strip(': ')):
-            return title
-    # Heuristic: standalone line in Title Case without trailing punctuation
-    if len(line.split()) <= 8 and line.istitle():
-        return line
-    return None
-
-def _render_slide_block(block_lines: List[str]) -> str:
-    # Expect keys like Slide Name, Why, Bullets, Sources
-    out = []
-    cur = {}
-    bullets: List[str] = []
-    for ln in block_lines:
-        if re.match(r"^Slide\s*Name", ln, flags=re.I):
-            if cur or bullets:
-                # flush previous
-                if bullets:
-                    cur["Bullets"] = bullets[:]
-                    bullets.clear()
-                out.append(_render_slide(cur))
-                cur = {}
-            val = ln.split("Slide",1)[1]
-            val = val.split("Name",1)[-1]
-            val = val.replace(":", "").strip().strip('"')
-            cur["Slide Name"] = val
-        elif re.match(r"^Why", ln, flags=re.I):
-            cur["Why"] = ln.split(":",1)[-1].strip().strip('"') if ":" in ln else ln[3:].strip().strip('"')
-        elif re.match(r"^New\s*Title", ln, flags=re.I):
-            cur["New Title"] = ln.split(":",1)[-1].strip().strip('"') if ":" in ln else ln.split("New",1)[-1].strip().strip('"')
-        elif re.match(r"^Sources?", ln, flags=re.I):
-            cur["Sources"] = ln.split(":",1)[-1].strip().strip('"') if ":" in ln else ln
-        elif re.match(r"^(Bullets?)$", ln, flags=re.I):
-            continue
-        elif re.match(r"^[\-\*\u2022]", ln) or re.match(r"^\d+\.", ln):
-            bullets.append(re.sub(r"^\d+\.\s*", "", ln).lstrip("-*").strip())
-        elif ln:
-            # Treat as free text; append to Why if present else Notes
-            key = "Why" if "Why" in cur else "Notes"
-            cur[key] = (cur.get(key, "") + (" " if cur.get(key) else "") + ln).strip()
-    if cur or bullets:
-        if bullets:
-            cur["Bullets"] = bullets
-        out.append(_render_slide(cur))
-    return "\n\n".join([o for o in out if o])
-
-def _render_slide(data: dict) -> str:
-    title = data.get("Slide Name") or data.get("Title") or "Slide"
-    parts = [f"- **Slide Name**: {title}"]
-    if data.get("New Title"):
-        parts.append(f"- **New Title**: {data['New Title']}")
-    if data.get("Why"):
-        parts.append(f"- **Why**: {data['Why']}")
-    if data.get("Bullets"):
-        for b in data["Bullets"]:
-            parts.append(f"  - {b}")
-    if data.get("Sources"):
-        parts.append(f"- **Sources**: {data['Sources']}")
-    if data.get("Notes"):
-        parts.append(f"- **Notes**: {data['Notes']}")
-    return "\n".join(parts)
-
-def _format_block_as_list(block_lines: List[str]) -> str:
-    out = []
-    for ln in block_lines:
-        if not ln:
-            continue
-        if re.match(r"^[\-\*]", ln):
-            out.append(f"- {ln.lstrip('-* ').strip()}")
-        elif re.match(r"^\d+\.", ln):
-            out.append(re.sub(r"^(\d+)\.\s*", r"1. ", ln))
-        else:
-            out.append(ln)
-    return "\n".join(out)
-
-def format_dify_output(text: str) -> str:
-    # If OpenAI key present, try a light reformat via OpenAI first
-    if OPENAI_KEY:
-        try:
-            resp = requests.post(
-                "https://api.openai.com/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {OPENAI_KEY}",
-                    "Content-Type": "application/json",
-                },
-                json={
-                    "model": "gpt-4o-mini",
-                    "temperature": 0,
-                    "max_tokens": min(2048, max(300, len(text) // 4)),
-                    "messages": [
-                        {"role": "system", "content": """You are a strict Markdown formatter.
+def format_with_openai(text: str) -> str:
+    """
+    Use OpenAI to strictly format the Dify output into the required Markdown layout.
+    If OPENAI_KEY is missing or the API fails, fall back to the original text.
+    """
+    if not OPENAI_KEY:
+        return text
+    try:
+        resp = requests.post(
+            "https://api.openai.com/v1/chat/completions",
+            headers={
+                "Authorization": f"Bearer {OPENAI_KEY}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": "gpt-4o-mini",
+                "temperature": 0,
+                "max_tokens": min(2048, max(300, len(text) // 4)),
+                "messages": [
+                    {
+                        "role": "system",
+                        "content": """You are a strict Markdown formatter.
 Your ONLY job: take whatever text the user provides (messy, unstructured, or chatty) and rewrite it into the exact schema below. Do not add greetings, explanations, or extra lines. No code blocks.
 
 Global formatting rules
@@ -486,20 +387,6 @@ Global formatting rules
 - One blank line between sections. No extra blank lines inside items.
 
 Required section order & shapes
-
-Thanks for uploading Pitch Deck, Model is cooking
-
-Please wait.
-
-You can also do your token audit using our Tokenomics Audit Tool: https://www.tokenomics.checker.tde.fi/ (link)
-
-Here's What our Model Thinks For Pitch Deck: (Just for refernce)
-Need Some Changes
-
-Reason
-
-- Deck has strong vision and traction but lacks clear competition, business metrics, and more detail on go-to-market execution. (Just for refernce)
-
 1) **Strengths**
 - A simple bullet list. Each item starts with '- '.
 
@@ -509,27 +396,27 @@ Reason
 3) **Improvement Tips**
 - Use a numbered list.
 - For each item, nest the following lines exactly:
-  - **Slide Name**: &lt;Title&gt;
-  - Why: &lt;1–2 sentences&gt;
+  - **Slide Name**: <Title>
+  - Why: <1–2 sentences>
   - Bullets:
-    - &lt;point&gt;
-    - &lt;point&gt;
-  - Sources: &lt;short reference or "Not specified"&gt;
+    - <point>
+    - <point>
+  - Sources: <short reference or "Not specified">
 
- **Add**
+4) **Add**
 - Numbered list. Same 4 sub-lines as above. Use for NEW slides/content. If nothing to add, write '- None.'.
 
- **Remove / Merge**
+5) **Remove / Merge**
 - Numbered list. Same 4 sub-lines as above. In 'Why', state what to remove/merge and why.
 
- **Change**
+6) **Change**
 - Numbered list. Same 4 sub-lines **plus** a line for a new title if present:
-  - **Slide Name**: &lt;Current Title&gt;
-  - New Title: &lt;New Title&gt;  (omit if not applicable)
-  - Why: &lt;...&gt;
+  - **Slide Name**: <Current Title>
+  - New Title: <New Title>  (omit if not applicable)
+  - Why: <...>
   - Bullets:
-    - &lt;point&gt;
-  - Sources: &lt;...&gt;
+    - <point>
+  - Sources: <...>
 
 7) **Consistency Check**
 - A simple bullet list of cross-checks/contradictions. If none, '- None noted.'.
@@ -540,14 +427,13 @@ Reason
 9) **Data Points (Can Include)**
 - A simple bullet list of concrete numbers/tables to collect.
 
-
-Scheduled a demo call with us for more insights:
-
-https://calendly.com/tdefi_project_calls/45min (as a link)
+10) **Schedule a Demo Call**
+- Put the bold title on one line: **Schedule a Demo Call**
+- On the very next line, print ONLY a single link (no bullets or extra text). If multiple links appear, pick the most relevant single link.
 
 Normalization & cleanup
 - Convert any '•' or odd bullets → '- '.
-- Remove quotes around slide names (example: - **Slide Name**: Competition &amp; Differentiation).
+- Remove quotes around slide names (example: - **Slide Name**: Competition & Differentiation).
 - If a required field is missing, write a concise placeholder (e.g., - Sources: Not specified).
 - If the input mentions 'Add:' items inside other sections, move them under **Add** with the proper structure.
 
@@ -557,16 +443,13 @@ Self-check before finalizing (do NOT print this checklist)
 - 'Improvement Tips', 'Add', 'Remove / Merge', and 'Change' use numbered items, each containing the required sub-lines.
 - The final section shows the link on its own line (no bullets/text).
 
-Return ONLY the formatted Markdown.
+Output Formate Example (Strictly Follow This Format)
 
-Output Structure Example 
-"
-Thanks for uploading Pitch Deck, Model is cooking Please wait.
+"Thanks for uploading Pitch Deck, Model is cooking Please wait.
 
 You can also do your Token audit using our Tokenomics Audit Tool: https://www.tokenomics.checker.tde.fi/
 
 Here's What our Model Thinks For Pitch Deck:
-
 Need Multiple Changes
 
 Reason
@@ -586,26 +469,21 @@ Red Flags (High Priority Concerns)
 	•	Traction by segment and conversion/retention metrics are missing.
 
 Improvement Tips
-1.
-	•	Slide Name: Competition & Differentiation
+    1. Slide Name: Competition & Differentiation
 	•	Why: Investors must see direct comparisons and SINT’s edge over decentralized and centralized alternatives.
 	•	Bullets:
 	•	List top competitors (e.g., Fetch.ai, SingularityNET, Phala Network) and feature/funding/user comparisons.
 	•	Highlight unique moat (e.g., MCP protocol, confidential compute stack).
 	•	Sources: Not specified.
 
-	2.	
-
-	•	Slide Name: Go-To-Market Playbook
+	2.	Slide Name: Go-To-Market Playbook
 	•	Why: Needs concrete tactics per target segment from pilot → paid → scale.
 	•	Bullets:
 	•	Define ICPs, channels, and onboarding funnel with metrics.
 	•	Include a pilot case study and milestone timeline.
 	•	Sources: GTM broad in current deck.
 
-	3.	
-
-	•	Slide Name: Tokenomics Deep Dive
+	3.	Slide Name: Tokenomics Deep Dive
 	•	Why: Investors expect clear token utility, allocation, and emissions logic.
 	•	Bullets:
 	•	Allocation pie chart and vesting schedule.
@@ -613,17 +491,14 @@ Improvement Tips
 	•	Sources: Only surface-level token info present.
 
 Add
-1.
-	•	Slide Name: Competition & Differentiation
+    1. Slide Name: Competition & Differentiation
 	•	Why: Deck lacks an explicit competitor view; investors need apples-to-apples comparison.
 	•	Bullets:
 	•	Competitor matrix (features/users/funding).
 	•	Why partners choose SINT; evidence of switching.
 	•	Sources: Not specified.
 
-	2.	
-
-	•	Slide Name: Go-To-Market Execution Plan
+	2.	Slide Name: Go-To-Market Execution Plan
 	•	Why: Must show how you’ll acquire, convert, and retain initial ICPs.
 	•	Bullets:
 	•	First ICPs, channels, and growth loop.
@@ -631,26 +506,22 @@ Add
 	•	Sources: GTM sections are generic.
 
 Remove / Merge
-1.
-	•	Slide Name: Revenue from Partnerships
+    1. Slide Name: Revenue from Partnerships
 	•	Why: Repetitive with Business Model; merge for clarity.
 	•	Bullets:
 	•	Consolidate revenue details into the Business Model slide.
 	•	Sources: Duplicates existing content.
 
-Change
-1.
-	•	Slide Name: Business Model
+Change 
+    1. Slide Name: Business Model
 	•	New Title: How SINT Makes Money & Scales Revenue
 	•	Why: Current slide lists channels but lacks pricing/examples and scalability proof.
 	•	Bullets:
 	•	Show revenue streams with example pricing per user/partner type.
-	•	Add early results or projections; explain % split logic vs. norms.
+	•	Add early results or projections; explain percentage split logic vs. norms.
 	•	Sources: Existing “Commissions/Subscriptions/Marketplace” references.
 
-	2.	
-
-	•	Slide Name: Market Opportunity
+	2.	Slide Name: Market Opportunity
 	•	New Title: Market Size & Segmentation
 	•	Why: Needs TAM split by segments and priority focus with sources.
 	•	Bullets:
@@ -661,7 +532,7 @@ Change
 Consistency Check
 	•	$600k seed closed vs. $3.6M ask later—clarify whether this is a new round or cumulative.
 	•	Revenue projections appear aggressive without conversion math.
-	•	Initial circulating supply % has inconsistencies (if token is included).
+	•	Initial circulating supply percentage has inconsistencies (if token is included).
 
 The Action Plan
 	•	Build a competitor matrix versus Fetch.ai, SingularityNET, Phala Network.
@@ -680,67 +551,22 @@ Data Points (Can Include)
 
 Schedule a Demo Call
 https://calendly.com/tdefi_project_calls/45min"
-"""},
-                        {"role": "user", "content": text},
-                    ],
-                },
-                timeout=60,
-            )
-            if resp.status_code < 400:
-                j = resp.json()
-                content = ((j.get("choices") or [{}])[0].get("message") or {}).get("content")
-                if content and content.strip():
-                    text = content.strip()
-        except Exception:
-            pass
 
-    # Pre-sanitize any heading hashes and odd '###-' bullet starts
-    def _strip_heading_hashes(t: str) -> str:
-        t = t.replace("\r\n", "\n").replace("\r", "\n")
-        cleaned = []
-        for ln in t.split("\n"):
-            ln = re.sub(r"^\s*#+\s*[-*]\s+", "- ", ln)  # ### - point -> - point
-            ln = re.sub(r"^\s*#+\s*(\d+\.)\s+", r"\1 ", ln)  # ### 1. -> 1.
-            ln = re.sub(r"^\s*#+\s*", "", ln)  # strip remaining leading #
-            cleaned.append(ln)
-        return "\n".join(cleaned)
-
-    text = _strip_heading_hashes(text)
-    lines = _clean_lines(text)
-    # Split into sections
-    sections = []  # (title, lines)
-    cur_title = None
-    cur_lines: List[str] = []
-    for ln in lines:
-        title = _is_section_title(ln)
-        if title and (not cur_title or ln.lower().startswith(title.lower())):
-            if cur_title or cur_lines:
-                sections.append((cur_title, cur_lines))
-            cur_title = title.strip(': ')
-            cur_lines = []
-        else:
-            cur_lines.append(ln)
-    if cur_title or cur_lines:
-        sections.append((cur_title, cur_lines))
-
-    # If no explicit sections found, just bulletize
-    if all(t is None for t, _ in sections):
-        return _format_block_as_list(lines)
-
-    rendered = []
-    for title, block in sections:
-        if title:
-            # Render headings without markdown hashes, as bold text
-            rendered.append(f"**{title.strip()}**")
-        # Detect slide-structured blocks under certain sections
-        if any(k in (title or "").lower() for k in ["improvement", "change", "remove", "add"]):
-            rendered.append(_render_slide_block(block))
-        else:
-            rendered.append(_format_block_as_list(block))
-    # Final cleanup: collapse triple newlines
-    md = "\n\n".join([s.strip() for s in rendered if s and s.strip()])
-    md = re.sub(r"\n{3,}", "\n\n", md).strip()
-    return md
+Return ONLY the formatted Markdown."""
+                    },
+                    {"role": "user", "content": text},
+                ],
+            },
+            timeout=60,
+        )
+        if resp.status_code < 400:
+            j = resp.json()
+            content = ((j.get("choices") or [{}])[0].get("message") or {}).get("content")
+            if content and content.strip():
+                return content.strip()
+    except Exception:
+        pass
+    return text
 
 # -----------------------------
 # Minimal single-shot UI with pre-upload + progress
@@ -881,8 +707,8 @@ if start:
             final_text = dify_blocking_chat(query, files_payload or None, st.session_state.dify_user)
         prog.progress(100)
 
-        # Format the raw Dify output locally to match the structured style
-        final_output = format_dify_output(final_text)
+        # Format the raw Dify output using OpenAI to match the required Markdown style
+        final_output = format_with_openai(final_text)
 
         # clear the progress UI once complete
         prog_slot.empty()
